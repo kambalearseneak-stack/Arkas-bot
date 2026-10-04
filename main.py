@@ -41,19 +41,14 @@ def calculate_ema(prices, period):
     return ema[-1]
 
 async def get_candles(connection, symbol, timeframe, limit=100):
-    """
-    Récupère l'historique des chandelles via la méthode RPC MetaApi appropriée.
-    """
     try:
-        candles = await connection.get_candle_price_history(
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit
-        )
+        # En MetaApi RPC, les bougies historiques s'obtiennent via connection.get_historical_candles
+        candles = await connection.get_historical_candles(symbol, timeframe, limit=limit)
         return candles
     except Exception as e:
         print(f"[{datetime.now()}] ❌ [{symbol}] Erreur lors de la récupération des bougies : {e}")
         return None
+    
 
 # 4. ANALYSE DU MARCHÉ ET DÉCISION
 
