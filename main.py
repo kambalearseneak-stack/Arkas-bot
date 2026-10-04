@@ -11,7 +11,7 @@ ACCOUNT_ID = "de1c262b-17d4-415c-bb1f-c49db0342d25"
 # ==========================================
 # 2. PARAMÈTRES POUR L'OR (GOLD)
 # ==========================================
-SYMBOL = "XAUUSD"            # Symbole Or
+SYMBOL = "XAUUSD.m"            # Symbole Or
 TIMEFRAME = "15m"            # Unité de temps
 LOT_SIZE = 0.01              # Taille du lot
 PIPS_TO_BREAK_EVEN = 15      # Profit en pips avant Break-Even
