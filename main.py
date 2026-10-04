@@ -9,7 +9,7 @@ from metaapi_cloud_sdk import MetaApi
 # ==============================================================================
 
 # 1. CONFIGURATION
-TOKEN = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiJlNzRjNTE2NjhkNjRhZTJkODI2NGE3YTMzZWYxMzE0YyIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVzdC1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcnBjLWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6d3M6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJtZXRhc3RhdHMtYXBpIiwibWV0aG9kcyI6WyJtZXRhc3RhdHMtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6InJpc2stbWFuYWdlbWVudC1hcGkiLCJtZXRob2RzIjpbInJpc2stbWFuYWdlbWVudC1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoiY29weWZhY3RvcnktYXBpIiwibWV0aG9kcyI6WyJjb3B5ZmFjdG9yeS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoibXQtbWFuYWdlci1hcGkiLCJtZXRob2RzIjpbIm10LW1hbmFnZXItYXBpOnJlc3Q6ZGVhbGluZzoqOioiLCJtdC1tYW5hZ2VyLWFwaTpyZXN0OnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJiaWxsaW5nLWFwaSIsIm1ldGhvZHMiOlsiYmlsbGluZy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiZTc0YzUxNjY4ZDY0YWUyZDgyNjRhN2EzM2VmMTMxNGMiLCJpYXQiOjE3OTExNTAwMjEsImV4cCI6MTc5ODkyNjAyMX0.L94eqhJdrr35hhxf3vfQgRE1fp1wsXR8ooNEbtnE1i23k039pV5GkKmpkPUykMPgkW_WhcZAjOOHQzduPEkCPm6n6AFc7R_qt1sRapHwZez42OtXJAADshHr0qjcB_al1N4EVnln2_ZFRwI61W4PyHoVmg3I23AVs4e7PhOYDb-pFfp6Wlc3YFBoDis307qiYp8HY060rqKwYOh4mtIofK98DEfaluLV_EzsHQNbbJr0NaIXTWfzSi234TY7fA8haEDyj0UM9lAEC8MDKqK2daLbxIoOINU-Nq5P7HJ8UkEu12Nhewh1gcKSOeA3xsYwoP6ueyyceOVp5-kWH5ClcznoKMSzIjoA5iYHQDO08O-B9KY_PGAo6qaogJPeeiNVAe6HLV0uvKaWRJ8aGEjcry06qNToeWoOm1tQpZWu_vrrAWg10OLldawI28R2x7Kuwcz9MrF7oOSH3Y0CZSbFTEjhYG9w7MAfcmGfG4SLZjpEzJbHgjsKSCZnUSakEhIVFxoA4of7SjcqjU8GkgMK0IUfqmkjYS4Hio5pU_8yml70OV4hqXpUOSt4LgZgKOx6h_KG4P8K2JrRZXFKE0iUjflojP5DdQPJ4_ZuUee0wvrC5rzx3KX6bMjKZIT7F6HHTA-Epo9LBDCeJKipUKpPeDiPWyO2BOERai6RVGdl5SU"  # Remplacez par votre token généré
+TOKEN = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiJlNzRjNTE2NjhkNjRhZTJkODI2NGE3YTMzZWYxMzE0YyIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVzdC1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcnBjLWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6d3M6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJtZXRhc3RhdHMtYXBpIiwibWV0aG9kcyI6WyJtZXRhc3RhdHMtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6InJpc2stbWFuYWdlbWVudC1hcGkiLCJtZXRob2RzIjpbInJpc2stbWFuYWdlbWVudC1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoiY29weWZhY3RvcnktYXBpIiwibWV0aG9kcyI6WyJjb3B5ZmFjdG9yeS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoibXQtbWFuYWdlci1hcGkiLCJtZXRob2RzIjpbIm10LW1hbmFnZXItYXBpOnJlc3Q6ZGVhbGluZzoqOioiLCJtdC1tYW5hZ2VyLWFwaTpyZXN0OnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJiaWxsaW5nLWFwaSIsIm1ldGhvZHMiOlsiYmlsbGluZy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiZTc0YzUxNjY4ZDY0YWUyZDgyNjRhN2EzM2VmMTMxNGMiLCJpYXQiOjE3OTExNTEwNzksImV4cCI6MTc5ODkyNzA3OX0.dbNm4Ezmnqs2eiNAD2teDzfAz59iw_5j74OuOGIXCDnUkYp_QeanRSSG_jYWdqIpMNg16U-k0c-Oav7cfQTA2yucuuwH1YyJqQKbM91d-Jc_NIpfmRt0H7Oy_od020tWfpxeCRC7_czmskGoEb1PCZRdy3uYpmoTxTnChz6GgL6ivX_kxYoGH28omAhr0UIfNxX3bLZ1poIqmbydg-oNXhR6oj8O_1ZW6ABEhU_F4WapGovSVcnvCak80WExfMxugOX8gvcS_UXvJXyEaTQJYDxOCTahIFfuQyISBJ77rkO57Hle4mltZyiGokR4A2GC6YuaoUJrtL_QJtpHBLOjnSi827KvIAGZ8zTLGDkoVFHkZsse4eKZap4Isn6_BQkl0ZC_097ZyxGKgCntlOaqXplxVWlVppLBO4-RLhMKfk71JckFyqF1CN8PAPzAsfr5gnyKBcYf2eCjypa9Avbmfq4qutesqbbHVUsa-vzUJhhvkeTm_gB_CcI-8F_Ennv7_3syfjCw5nT5SnDlCwyhIHSYn2wEOiX3BiWT7mLlKudWKbDu9uvuT3hqbmxwJjxBksCy94pY9ofP53oXZFxxZakQ6eGMl9N_5C0SePdh_11Cq31JFeFvG4GDt2pDuP7N8-P5F0bIwYKlpjjGs-2ecckYiAYp7vXQ_vQ_IH0PJpU"  # Remplacez par votre token MetaApi valide
 ACCOUNT_ID = "de1c262b-17d4-415c-bb1f-c49db0342d25"
 
 TIMEFRAME = "5m"
@@ -20,16 +20,15 @@ SYMBOLS = [
     "GBPJPY.m"
 ]
 
-# 2. GESTION DU RISQUE ET DE LA POSITION
+# 2. GESTION DU RISQUE ET PARAMÈTRES
 RISK_PERCENT = 1.0
 MAX_POSITIONS_PER_SYMBOL = 1
 
-# Paramètres de stratégie
 EMA_FAST = 20
 EMA_SLOW = 50
 CANDLE_COUNT = 100
 
-# 3. FONCTIONS UTILITAIRES DE CALCUL TECHNIQUE
+# 3. CALCULS TECHNIQUES
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -40,21 +39,26 @@ def calculate_ema(prices, period):
         ema.append((price - ema[-1]) * multiplier + ema[-1])
     return ema[-1]
 
-async def get_candles(connection, symbol, timeframe, limit=100):
+async def get_candles(account, symbol, timeframe, limit=100):
+    """
+    Récupère l'historique des bougies directement via l'objet account.
+    """
     try:
-        # En MetaApi RPC, les bougies historiques s'obtiennent via connection.get_historical_candles
-        candles = await connection.get_historical_candles(symbol, timeframe, limit=limit)
+        candles = await account.get_historical_candles(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit
+        )
         return candles
     except Exception as e:
         print(f"[{datetime.now()}] ❌ [{symbol}] Erreur lors de la récupération des bougies : {e}")
         return None
-    
 
-# 4. ANALYSE DU MARCHÉ ET DÉCISION
+# 4. ANALYSE DU MARCHÉ ET EXÉCUTIONDes TRADES
 
-async def analyze_and_trade(connection, symbol):
+async def analyze_and_trade(account, connection, symbol):
     try:
-        # Récupération des positions ouvertes sur ce symbole
+        # Récupération des positions ouvertes
         positions = await connection.get_positions()
         symbol_positions = [p for p in positions if p.get('symbol') == symbol]
 
@@ -62,7 +66,8 @@ async def analyze_and_trade(connection, symbol):
             print(f"[{datetime.now()}] ℹ️ [{symbol}] Position déjà ouverte ({len(symbol_positions)}/{MAX_POSITIONS_PER_SYMBOL}). On saute.")
             return
 
-        candles = await get_candles(connection, symbol, TIMEFRAME, CANDLE_COUNT)
+        # Récupération des bougies via 'account'
+        candles = await get_candles(account, symbol, TIMEFRAME, CANDLE_COUNT)
         if not candles or len(candles) < EMA_SLOW:
             print(f"[{datetime.now()}] ⚠️ [{symbol}] Pas assez de bougies récupérées pour l'analyse.")
             return
@@ -80,15 +85,25 @@ async def analyze_and_trade(connection, symbol):
 
         print(f"[{datetime.now()}] 📊 [{symbol}] Close: {last_candle['close']} | EMA20: {round(ema_20, 5)} | EMA50: {round(ema_50, 5)}")
 
-        # Condition Achat : Croisement Hausser EMA 20 > EMA 50
+        # Condition ACHAT (Buy) : Croisement Hausser EMA 20 > EMA 50
         if ema_20 > ema_50 and prev_candle['close'] <= calculate_ema(close_prices[:-1], EMA_FAST):
-            print(f"[{datetime.now()}] 🟢 [{symbol}] Signal ACHAT (Buy) détecté !")
-            # Logique de passage d'ordre ACHAT ici
+            print(f"[{datetime.now()}] 🟢 [{symbol}] Signal ACHAT (Buy) détecté ! Execution du trade...")
+            await connection.create_market_buy_order(
+                symbol=symbol,
+                volume=0.01,  # Ajuster le lot selon votre gestion de risque
+                stop_loss=None,
+                take_profit=None
+            )
 
-        # Condition Vente : Croisement Baisse EMA 20 < EMA 50
+        # Condition VENTE (Sell) : Croisement Baisse EMA 20 < EMA 50
         elif ema_20 < ema_50 and prev_candle['close'] >= calculate_ema(close_prices[:-1], EMA_FAST):
-            print(f"[{datetime.now()}] 🔴 [{symbol}] Signal VENTE (Sell) détecté !")
-            # Logique de passage d'ordre VENTE ici
+            print(f"[{datetime.now()}] 🔴 [{symbol}] Signal VENTE (Sell) détecté ! Execution du trade...")
+            await connection.create_market_sell_order(
+                symbol=symbol,
+                volume=0.01,  # Ajuster le lot selon votre gestion de risque
+                stop_loss=None,
+                take_profit=None
+            )
 
     except Exception as e:
         print(f"[{datetime.now()}] ❌ [{symbol}] Erreur analyse/ordre : {e}")
@@ -119,10 +134,9 @@ async def main():
 
         while True:
             for symbol in SYMBOLS:
-                await analyze_and_trade(connection, symbol)
-                await asyncio.sleep(2)  # Pause légère entre chaque symbole
+                await analyze_and_trade(account, connection, symbol)
+                await asyncio.sleep(2)
             
-            # Pause de 15 secondes avant le prochain scan
             await asyncio.sleep(15)
 
     except Exception as e:
