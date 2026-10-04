@@ -1,9 +1,9 @@
 name: Executer Robot Trading
 
 on:
-  workflow_dispatch: # Permet de lancer le robot manuellement depuis GitHub
+  workflow_dispatch: # Permet de lancer le robot manuellement en un clic
   schedule:
-    - cron: '0 * * * *' # S'exécute automatiquement toutes les heures (optionnel)
+    - cron: '*/15 * * * *' # S'exécute automatiquement toutes les 15 minutes
 
 jobs:
   run-trading-bot:
@@ -25,3 +25,4 @@ jobs:
 
       - name: Lancer le robot
         run: python main.py
+        
