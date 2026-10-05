@@ -8,11 +8,10 @@ from metaapi_cloud_sdk import MetaApi
 
 
 # ==============================================================================
-# ARKAS M5 AGGRESSIVE — DEMO (VERSION FINALE CORRIGÉE)
+# ARKAS M5 AGGRESSIVE — DEMO (VERSION FINALE)
 # ==============================================================================
-# CORRECTION MAJEURE :
-#   Les bougies sont récupérées via `account.get_historical_candles()`
-#   et NON via `connection.get_historical_candles()`.
+# - Récupération des bougies via `account.get_historical_candles()`
+# - Limite de volume spécifique pour XAUUSD.m : 0.01 → 0.03 lot
 # ==============================================================================
 
 # ==============================================================================
@@ -50,6 +49,17 @@ RISK_PERCENT = 1.0
 MAX_POSITIONS_PER_SYMBOL = 1
 
 RR_RATIO = 2.0
+
+
+# ==============================================================================
+# LIMITE DE VOLUME SPÉCIFIQUE PAR SYMBOLE
+# ==============================================================================
+# Si un symbole est présent ici, le volume calculé sera FORCÉ
+# dans cet intervalle [min, max], peu importe le risque théorique.
+
+VOLUME_LIMITS = {
+    "XAUUSD.m": {"min": 0.01, "max": 0.03},
+}
 
 
 # ==============================================================================
@@ -131,11 +141,7 @@ def calculate_ema(prices, period):
 
 
 # ==============================================================================
-# 10. RÉCUPÉRATION DES BOUGIES  ← ⚠️ CORRECTION CRUCIALE ICI
-# ==============================================================================
-# On utilise `account` (objet MetatraderAccount) et non `connection`.
-# C'est ce qui causait l'erreur : 'RpcMetaApiConnectionInstance' object
-# has no attribute 'get_historical_candles'.
+# 10. RÉCUPÉRATION DES BOUGIES
 # ==============================================================================
 
 async def get_candles(
@@ -157,7 +163,6 @@ async def get_candles(
             return None
 
         # La dernière bougie peut être encore en formation.
-        # On ne l'utilise donc pas pour le signal.
         if len(candles) > 2:
             candles = candles[:-1]
 
@@ -610,7 +615,7 @@ def normalize_volume(
 
 
 # ==============================================================================
-# 20. CALCUL VOLUME 1%
+# 20. CALCUL VOLUME 1%  (avec limite spécifique Gold 0.01 → 0.03)
 # ==============================================================================
 
 async def calculate_volume(
@@ -665,12 +670,35 @@ async def calculate_volume(
             )
         )
 
+        # Correction : utiliser contractSize en priorité
         contract_size = float(
             specification.get(
-                "tradeContractSize",
-                1
+                "contractSize",
+                specification.get("tradeContractSize", 1)
             )
         )
+
+        if contract_size <= 0:
+            log(f"[{symbol}] ⚠️ contractSize invalide ({contract_size})")
+            return None
+
+        # ----------------------------------------------------------
+        # LIMITE SPÉCIFIQUE PAR SYMBOLE (ex: Gold 0.01 → 0.03)
+        # ----------------------------------------------------------
+
+        if symbol in VOLUME_LIMITS:
+
+            limits = VOLUME_LIMITS[symbol]
+
+            minimum = max(minimum, limits["min"])
+            maximum = min(maximum, limits["max"])
+
+            log(
+                f"[{symbol}] 🎯 Limite spécifique appliquée : "
+                f"min={minimum} / max={maximum}"
+            )
+
+        # ----------------------------------------------------------
 
         risk_money = (
             balance
@@ -705,11 +733,33 @@ async def calculate_volume(
             step
         )
 
+        # ----------------------------------------------------------
+        # VÉRIFICATION FINALE : on re-clampe après normalisation
+        # ----------------------------------------------------------
+
+        if symbol in VOLUME_LIMITS:
+
+            limits = VOLUME_LIMITS[symbol]
+
+            volume = max(
+                limits["min"],
+                min(volume, limits["max"])
+            )
+
+            volume = normalize_volume(
+                volume,
+                limits["min"],
+                limits["max"],
+                step
+            )
+
         log(
             f"[{symbol}] "
             f"Balance={balance:.2f} | "
             f"Risque={risk_money:.2f} | "
-            f"Volume={volume}"
+            f"contractSize={contract_size} | "
+            f"distance={price_distance:.5f} | "
+            f"Volume final={volume}"
         )
 
         return volume
@@ -1024,7 +1074,7 @@ async def manage_trailing(
 
 
 # ==============================================================================
-# 24. ANALYSE + TRADE  ← ⚠️ On passe maintenant `account` en paramètre
+# 24. ANALYSE + TRADE
 # ==============================================================================
 
 async def analyze_and_trade(
@@ -1050,7 +1100,7 @@ async def analyze_and_trade(
 
             return
 
-        # BOUGIES — via `account` (corrigé)
+        # BOUGIES
         candles = await get_candles(
             account,
             symbol,
@@ -1315,7 +1365,7 @@ async def analyze_and_trade(
 
 
 # ==============================================================================
-# 25. MAIN  ← ⚠️ On passe `account` à analyze_and_trade
+# 25. MAIN
 # ==============================================================================
 
 async def main():
@@ -1344,6 +1394,9 @@ async def main():
     )
     print(
         f"Score min : {MIN_SCORE}/6"
+    )
+    print(
+        f"Limites   : {VOLUME_LIMITS}"
     )
     print(
         "Mode      : COMPTE DEMO / ORDRES ACTIFS"
@@ -1444,7 +1497,6 @@ async def main():
 
                 for symbol in SYMBOLS:
 
-                    # ⚠️ On passe `account` pour récupérer les bougies
                     await analyze_and_trade(
                         account,
                         connection,
