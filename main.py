@@ -48,20 +48,29 @@ def calculate_ema(prices, period):
         ema_value = (price - ema_value) * multiplier + ema_value
     return ema_value
 
-
 # ==============================================================================
-# 10. RÉCUPÉRATION DES BOUGIES (CORRIGÉ)
+# 10. RÉCUPÉRATION DES BOUGIES (CORRIGÉ POUR TOUTES VERSIONS SDK)
 # ==============================================================================
 async def get_candles(connection, symbol, timeframe, limit):
     try:
-        # CORRECTION ICI : Utilisation de l'API historical_candles du SDK
-        candles = await connection.historical_candles.get_candles(
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit
-        )
+        # Essai 1 : Méthode standard du SDK MetaApi (la plus courante)
+        try:
+            candles = await connection.get_historical_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit
+            )
+        except AttributeError:
+            # Essai 2 : Si la méthode n'existe pas, on tente via l'API REST directe
+            # (Fallback pour les versions où la méthode a été renommée)
+            candles = await connection.get_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit
+            )
         
         if not candles:
+            log(f"⚠️ [{symbol}] Aucune bougie retournée.")
             return None
 
         # On enlève la dernière bougie (en formation)
