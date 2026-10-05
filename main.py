@@ -162,8 +162,7 @@ def calculate_ema(prices, period):
 # ==============================================================================
 
 async def get_candles(
-    historical_api,
-    account_id,
+    connection,
     symbol,
     timeframe,
     limit
@@ -171,11 +170,11 @@ async def get_candles(
 
     try:
 
-        candles = await historical_api.get_historical_candles(
-            account_id,
+        candles = await connection.get_historical_candles(
             symbol,
             timeframe,
-            limit=limit
+            None,
+            limit
         )
 
         if not candles:
@@ -1102,7 +1101,6 @@ async def manage_trailing(
 
 async def analyze_and_trade(
     connection,
-    historical_api,
     symbol
 ):
 
@@ -1131,8 +1129,7 @@ async def analyze_and_trade(
         # ----------------------------------------------------------
 
         candles = await get_candles(
-            historical_api,
-            ACCOUNT_ID,
+            connection,
             symbol,
             TIMEFRAME,
             CANDLE_COUNT
@@ -1478,9 +1475,6 @@ async def main():
         TOKEN
     )
 
-    # Service d'historique des données de marché de MetaApi
-    historical_api = api.historical_market_data_api
-
     try:
 
         # ----------------------------------------------------------
@@ -1575,7 +1569,6 @@ async def main():
 
                     await analyze_and_trade(
                         connection,
-                        historical_api,
                         symbol
                     )
 
