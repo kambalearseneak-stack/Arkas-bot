@@ -158,11 +158,12 @@ def calculate_ema(prices, period):
 
 
 # ==============================================================================
-# 10. RÉCUPÉRATION DES BOUGIES
+# 10. RÉCUPÉRATION DES BOUGIES (CORRIGÉ)
 # ==============================================================================
 
 async def get_candles(
-    connection,
+    historical_api,
+    account_id,
     symbol,
     timeframe,
     limit
@@ -170,11 +171,11 @@ async def get_candles(
 
     try:
 
-        candles = await connection.get_historical_candles(
+        candles = await historical_api.get_historical_candles(
+            account_id,
             symbol,
             timeframe,
-            None,
-            limit
+            limit=limit
         )
 
         if not candles:
@@ -1096,11 +1097,12 @@ async def manage_trailing(
 
 
 # ==============================================================================
-# 24. ANALYSE + TRADE
+# 24. ANALYSE + TRADE (CORRIGÉ)
 # ==============================================================================
 
 async def analyze_and_trade(
     connection,
+    historical_api,
     symbol
 ):
 
@@ -1125,11 +1127,12 @@ async def analyze_and_trade(
             return
 
         # ----------------------------------------------------------
-        # BOUGIES
+        # BOUGIES (CORRIGÉ)
         # ----------------------------------------------------------
 
         candles = await get_candles(
-            connection,
+            historical_api,
+            ACCOUNT_ID,
             symbol,
             TIMEFRAME,
             CANDLE_COUNT
@@ -1426,7 +1429,7 @@ async def analyze_and_trade(
 
 
 # ==============================================================================
-# 25. MAIN
+# 25. MAIN (CORRIGÉ)
 # ==============================================================================
 
 async def main():
@@ -1474,6 +1477,9 @@ async def main():
     api = MetaApi(
         TOKEN
     )
+
+    # Service d'historique des données de marché de MetaApi
+    historical_api = api.historical_market_data_api
 
     try:
 
@@ -1569,6 +1575,7 @@ async def main():
 
                     await analyze_and_trade(
                         connection,
+                        historical_api,
                         symbol
                     )
 
