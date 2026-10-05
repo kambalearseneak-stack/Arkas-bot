@@ -24,5 +24,6 @@ jobs:
           pip install metaapi-cloud-sdk asyncio
 
       - name: Lancer le robot
+        env:
+          METAAPI_TOKEN: ${{ secrets.METAAPI_TOKEN }}
         run: python main.py
-        
