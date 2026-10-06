@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: arkas-stoch-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: METAAPI_ACCOUNT_ID
+        value: fb767521-946d-40e4-b9cf-09e9b130f0dd
+      - key: PYTHON_VERSION
+        value: 3.10.13
