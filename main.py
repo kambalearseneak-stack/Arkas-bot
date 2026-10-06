@@ -7,7 +7,7 @@ from datetime import datetime
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.1
+# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.1 (Render 24/7)
 # ==============================================================================
 
 # ==============================================================================
@@ -30,7 +30,7 @@ TIMEFRAME_ANALYSIS = "1h"
 TIMEFRAME_ENTRY = "15m"
 
 # ==============================================================================
-# 3. PARAMÈTRES STOCHASTIQUE (5, 3, 3)
+# 3. STOCHASTIQUE (5, 3, 3)
 # ==============================================================================
 
 STOCH_K = 5
@@ -581,22 +581,63 @@ async def analyze_and_trade(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur analyse/trading : {e}")
 
 # ==============================================================================
-# 20. MAIN
+# 20. MAIN — BOUCLE 24/7 + HEALTH CHECK HTTP POUR RENDER
 # ==============================================================================
 
+async def trading_loop(account, connection):
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                await analyze_and_trade(account, connection, symbol)
+            await asyncio.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            log(f"⚠️ Erreur boucle : {e}")
+            await asyncio.sleep(10)
+
+async def health_check_server():
+    port = int(os.getenv("PORT", 10000))
+
+    async def handle(reader, writer):
+        try:
+            await reader.read(1024)
+            body = b"Arkas Bot OK"
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            writer.write(response)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, "0.0.0.0", port)
+    log(f"🌐 Health check HTTP sur port {port}")
+    async with server:
+        await server.serve_forever()
+
 async def main():
-    print("==================================================")
-    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.1")
-    print("==================================================")
-    print(f"Symboles : {', '.join(SYMBOLS)}")
-    print(f"Timeframes : {TIMEFRAME_ANALYSIS} → {TIMEFRAME_ENTRY}")
-    print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]))
-    print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}")
-    print(f"TP initial : {RISK_REWARD_RATIO}R")
-    print("==================================================")
+    print("==================================================", flush=True)
+    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.1", flush=True)
+    print("Mode : RENDER 24/7", flush=True)
+    print("==================================================", flush=True)
+    print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
+    print(f"Timeframes : {TIMEFRAME_ANALYSIS} → {TIMEFRAME_ENTRY}", flush=True)
+    print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
+    print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}", flush=True)
+    print(f"TP initial : {RISK_REWARD_RATIO}R", flush=True)
+    print("==================================================", flush=True)
 
     if not TOKEN:
         raise RuntimeError("METAAPI_TOKEN manquant.")
+
+    asyncio.create_task(health_check_server())
 
     api = MetaApi(TOKEN)
 
@@ -611,16 +652,9 @@ async def main():
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized(60)
-        log("🟢 BOT CONNECTÉ")
+        log("🟢 BOT CONNECTÉ — Tourne 24/7")
 
-        while True:
-            try:
-                for symbol in SYMBOLS:
-                    await analyze_and_trade(account, connection, symbol)
-                await asyncio.sleep(SCAN_INTERVAL)
-            except Exception as e:
-                log(f"⚠️ Erreur boucle : {e}")
-                await asyncio.sleep(10)
+        await trading_loop(account, connection)
 
     except Exception as e:
         log(f"❌ ERREUR FATALE : {e}")
