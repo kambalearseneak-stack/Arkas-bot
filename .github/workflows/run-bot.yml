@@ -1,4 +1,4 @@
-name: Executer Robot Trading
+name: Executer Robot Trading Stochastique
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
       - name: Installer les dépendances
         run: |
           python -m pip install --upgrade pip
-          pip install metaapi-cloud-sdk asyncio
+          pip install metaapi-cloud-sdk
 
       - name: Lancer le robot
         env:
