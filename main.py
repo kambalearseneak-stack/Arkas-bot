@@ -7,8 +7,7 @@ from datetime import datetime
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — VERSION 4.0
-# Sortie sur retournement réel + Break-even à +1R + Trailing ATR
+# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.1
 # ==============================================================================
 
 # ==============================================================================
@@ -45,12 +44,11 @@ LEVEL_SELL = 90
 H1_BUY_ZONE = 20
 H1_SELL_ZONE = 80
 
-# Seuil de l'alerte "mouvement mature" (pas de clôture automatique)
 ALERT_OVERBOUGHT = 85
 ALERT_OVERSOLD = 15
 
 # ==============================================================================
-# 4. MONEY MANAGEMENT — LOT FIXE MINIMUM PAR ACTIF
+# 4. MONEY MANAGEMENT
 # ==============================================================================
 
 LOT_PER_SYMBOL = {
@@ -71,7 +69,7 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 5. GESTION POSITION — BE À +1R + TRAILING ATR
+# 5. GESTION POSITION
 # ==============================================================================
 
 ATR_PERIOD = 14
@@ -90,7 +88,7 @@ SCAN_INTERVAL = 15
 CANDLES_LIMIT = 300
 
 # ==============================================================================
-# 7. PROTECTION SPREAD
+# 7. SPREAD
 # ==============================================================================
 
 MAX_SPREAD = {
@@ -99,7 +97,7 @@ MAX_SPREAD = {
 }
 
 # ==============================================================================
-# 8. ANTI-SPAM + ÉTAT PAR SYMBOLE
+# 8. ANTI-SPAM + ÉTAT
 # ==============================================================================
 
 LAST_TRADED_CANDLE = {}
@@ -114,7 +112,7 @@ def ensure_position_state(symbol):
     return POSITION_STATE[symbol]
 
 # ==============================================================================
-# 9. UTILS & LOG
+# 9. UTILS
 # ==============================================================================
 
 def log(message):
@@ -183,7 +181,7 @@ def calculate_atr(candles, period=ATR_PERIOD):
     return sum(trs[-period:]) / period
 
 # ==============================================================================
-# 12. STRUCTURE DE PRIX
+# 12. STRUCTURE
 # ==============================================================================
 
 def detect_structure(candles, lookback=5):
@@ -249,11 +247,10 @@ def structure_confirms_sell(candles, current_price, lookback=5):
     return wick_rejection and below_swing
 
 # ==============================================================================
-# 13. DÉTECTION DE RETOURNEMENT RÉEL (SORTIE)
+# 13. RETOURNEMENTS
 # ==============================================================================
 
 def detect_bullish_reversal(candles_m15, stoch):
-    """Retournement baissier : on sort d'une position BUY."""
     if not stoch or len(stoch["k"]) < 3:
         return False
 
@@ -275,7 +272,6 @@ def detect_bullish_reversal(candles_m15, stoch):
     return False
 
 def detect_bearish_reversal(candles_m15, stoch):
-    """Retournement haussier : on sort d'une position SELL."""
     if not stoch or len(stoch["k"]) < 3:
         return False
 
@@ -297,7 +293,7 @@ def detect_bearish_reversal(candles_m15, stoch):
     return False
 
 # ==============================================================================
-# 14. RÉCUPÉRATION DES BOUGIES
+# 14. BOUGIES
 # ==============================================================================
 
 async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
@@ -311,7 +307,7 @@ async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
         return None
 
 # ==============================================================================
-# 15. VÉRIFICATION SYMBOLE
+# 15. VÉRIF SYMBOLE
 # ==============================================================================
 
 async def is_symbol_tradable(connection, symbol):
@@ -328,7 +324,7 @@ async def is_symbol_tradable(connection, symbol):
         return False, None
 
 # ==============================================================================
-# 16. VOLUME — LOT FIXE MINIMUM
+# 16. VOLUME
 # ==============================================================================
 
 def get_fixed_lot(symbol, spec):
@@ -341,7 +337,7 @@ def get_fixed_lot(symbol, spec):
     return volume
 
 # ==============================================================================
-# 17. VALIDATION STOPS + FREEZE LEVEL
+# 17. STOPS
 # ==============================================================================
 
 def get_min_stop_distance(spec, digits):
@@ -378,7 +374,7 @@ def can_modify_sl(spec, current_price, new_sl, digits):
     return abs(current_price - new_sl) >= min_distance
 
 # ==============================================================================
-# 18. GESTION DES POSITIONS
+# 18. GESTION POSITIONS
 # ==============================================================================
 
 async def manage_open_positions(account, connection, symbol):
@@ -425,10 +421,9 @@ async def manage_open_positions(account, connection, symbol):
 
             initial_risk = state["initial_risk"]
 
-            # ---------------- BUY ----------------
             if pos_type == "POSITION_TYPE_BUY":
                 if (curr_k >= ALERT_OVERBOUGHT or curr_d >= ALERT_OVERBOUGHT) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone haute ({curr_k:.1f}/{curr_d:.1f}) — surveillance retournement")
+                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone haute ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
                 profit = bid - open_price
@@ -448,15 +443,14 @@ async def manage_open_positions(account, connection, symbol):
                         current_sl = new_sl
 
                 if detect_bullish_reversal(candles_m15, stoch_m15):
-                    log(f"🔴 [{symbol}] Retournement baissier confirmé → Fermeture BUY #{pos_id}")
+                    log(f"🔴 [{symbol}] Retournement baissier → Fermeture BUY #{pos_id}")
                     await connection.close_position(pos_id)
                     reset_position_state(symbol)
                     continue
 
-            # ---------------- SELL ----------------
             elif pos_type == "POSITION_TYPE_SELL":
                 if (curr_k <= ALERT_OVERSOLD or curr_d <= ALERT_OVERSOLD) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone basse ({curr_k:.1f}/{curr_d:.1f}) — surveillance retournement")
+                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone basse ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
                 profit = open_price - ask
@@ -476,7 +470,7 @@ async def manage_open_positions(account, connection, symbol):
                         current_sl = new_sl
 
                 if detect_bearish_reversal(candles_m15, stoch_m15):
-                    log(f"🟢 [{symbol}] Retournement haussier confirmé → Fermeture SELL #{pos_id}")
+                    log(f"🟢 [{symbol}] Retournement haussier → Fermeture SELL #{pos_id}")
                     await connection.close_position(pos_id)
                     reset_position_state(symbol)
                     continue
@@ -485,7 +479,7 @@ async def manage_open_positions(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur gestion positions : {e}")
 
 # ==============================================================================
-# 19. ANALYSE MTF ET EXÉCUTION
+# 19. ANALYSE MTF
 # ==============================================================================
 
 async def analyze_and_trade(account, connection, symbol):
@@ -503,7 +497,6 @@ async def analyze_and_trade(account, connection, symbol):
             await manage_open_positions(account, connection, symbol)
             return
 
-        # H1 filtre
         candles_h1 = await get_candles(account, symbol, TIMEFRAME_ANALYSIS)
         stoch_h1 = calculate_stochastic(candles_h1, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_h1:
@@ -516,7 +509,6 @@ async def analyze_and_trade(account, connection, symbol):
         if not (h1_buy_setup or h1_sell_setup):
             return
 
-        # M15 confirmation
         candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
@@ -532,14 +524,12 @@ async def analyze_and_trade(account, connection, symbol):
         if not (buy_confirmed or sell_confirmed):
             return
 
-        # Anti-spam M15
         last_candle_time = candles_m15[-1].get("time") or candles_m15[-1].get("brokerTime")
         if last_candle_time is None:
             return
         if LAST_TRADED_CANDLE.get(symbol) == last_candle_time:
             return
 
-        # Prix + structure
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
 
@@ -550,13 +540,11 @@ async def analyze_and_trade(account, connection, symbol):
             log(f"🚫 [{symbol}] Structure prix invalide pour SELL")
             return
 
-        # Spread
         spread = ask - bid
         if spread > MAX_SPREAD.get(symbol, 999.0):
             log(f"🚫 [{symbol}] Spread trop élevé ({spread:.2f})")
             return
 
-        # SL / TP
         atr_m15 = calculate_atr(candles_m15, ATR_PERIOD)
         sl_distance = atr_m15 * ATR_SL_MULTIPLIER if atr_m15 and atr_m15 > 0 else DEFAULT_SL_POINTS.get(symbol, 100.0)
         tp_distance = sl_distance * RISK_REWARD_RATIO
@@ -569,7 +557,7 @@ async def analyze_and_trade(account, connection, symbol):
             tp = normalize_price(entry + tp_distance, digits)
             sl, tp = validate_stops(spec, entry, sl, tp, digits)
 
-            log(f"🚀 [{symbol}] ACHAT | Entry={entry} | SL={sl} (1R) | TP={tp} (2R) | Vol={volume}")
+            log(f"🚀 [{symbol}] ACHAT | Entry={entry} | SL={sl} | TP={tp} | Vol={volume}")
             await connection.create_market_buy_order(
                 symbol=symbol, volume=volume, stop_loss=sl, take_profit=tp
             )
@@ -582,7 +570,7 @@ async def analyze_and_trade(account, connection, symbol):
             tp = normalize_price(entry - tp_distance, digits)
             sl, tp = validate_stops(spec, entry, sl, tp, digits)
 
-            log(f"🔻 [{symbol}] VENTE | Entry={entry} | SL={sl} (1R) | TP={tp} (2R) | Vol={volume}")
+            log(f"🔻 [{symbol}] VENTE | Entry={entry} | SL={sl} | TP={tp} | Vol={volume}")
             await connection.create_market_sell_order(
                 symbol=symbol, volume=volume, stop_loss=sl, take_profit=tp
             )
@@ -598,13 +586,12 @@ async def analyze_and_trade(account, connection, symbol):
 
 async def main():
     print("==================================================")
-    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0")
+    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.1")
     print("==================================================")
     print(f"Symboles : {', '.join(SYMBOLS)}")
     print(f"Timeframes : {TIMEFRAME_ANALYSIS} → {TIMEFRAME_ENTRY}")
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]))
     print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}")
-    print(f"Sortie : retournement %K/%D en zone opposée ou cassure structure")
     print(f"TP initial : {RISK_REWARD_RATIO}R")
     print("==================================================")
 
@@ -623,7 +610,7 @@ async def main():
 
         connection = account.get_rpc_connection()
         await connection.connect()
-        await connection.wait_synchronized({"timeoutInSeconds": 60})
+        await connection.wait_synchronized(60)
         log("🟢 BOT CONNECTÉ")
 
         while True:
