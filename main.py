@@ -7,7 +7,7 @@ from datetime import datetime
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.1 (Render 24/7)
+# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.2 (Fix région London)
 # ==============================================================================
 
 # ==============================================================================
@@ -16,6 +16,7 @@ from metaapi_cloud_sdk import MetaApi
 
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0dd")
+METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 
 # ==============================================================================
 # 2. MARCHÉS
@@ -624,7 +625,7 @@ async def health_check_server():
 
 async def main():
     print("==================================================", flush=True)
-    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.1", flush=True)
+    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.2", flush=True)
     print("Mode : RENDER 24/7", flush=True)
     print("==================================================", flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
@@ -632,6 +633,7 @@ async def main():
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
     print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}", flush=True)
     print(f"TP initial : {RISK_REWARD_RATIO}R", flush=True)
+    print(f"Région MetaApi : {METAAPI_REGION}", flush=True)
     print("==================================================", flush=True)
 
     if not TOKEN:
@@ -642,8 +644,11 @@ async def main():
     api = MetaApi(TOKEN)
 
     try:
-        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-        log(f"Compte MetaApi : {account.name} ({account.state})")
+        account = await api.metatrader_account_api.get_account(
+            ACCOUNT_ID,
+            METAAPI_REGION
+        )
+        log(f"Compte MetaApi : {account.name} ({account.state}) | Région: {METAAPI_REGION}")
 
         if account.state != "DEPLOYED":
             log("Déploiement du compte...")
