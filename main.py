@@ -7,7 +7,7 @@ from datetime import datetime
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.2 (Fix région London)
+# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.3 (Region dans constructeur MetaApi)
 # ==============================================================================
 
 # ==============================================================================
@@ -625,7 +625,7 @@ async def health_check_server():
 
 async def main():
     print("==================================================", flush=True)
-    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.2", flush=True)
+    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.3", flush=True)
     print("Mode : RENDER 24/7", flush=True)
     print("==================================================", flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
@@ -641,13 +641,12 @@ async def main():
 
     asyncio.create_task(health_check_server())
 
-    api = MetaApi(TOKEN)
+    # ✅ La région se passe à la création du client MetaApi
+    api = MetaApi(TOKEN, {"region": METAAPI_REGION})
 
     try:
-        account = await api.metatrader_account_api.get_account(
-            ACCOUNT_ID,
-            METAAPI_REGION
-        )
+        # ✅ get_account() avec un seul argument
+        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
         log(f"Compte MetaApi : {account.name} ({account.state}) | Région: {METAAPI_REGION}")
 
         if account.state != "DEPLOYED":
