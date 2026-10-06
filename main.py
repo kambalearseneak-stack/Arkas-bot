@@ -15,7 +15,7 @@ from metaapi_cloud_sdk import MetaApi
 # ==============================================================================
 
 TOKEN = os.getenv("METAAPI_TOKEN")
-ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "de1c262b-17d4-415c-bb1f-c49db0342d25")
+ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0dd")
 
 # ==============================================================================
 # 2. MARCHÉS
