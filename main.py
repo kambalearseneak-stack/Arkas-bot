@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS BOT — STOCH (recette originale) + OB POC LIQUIDITÉ
+# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks)
+# Liquidité désactivée + SL intelligent (buffer + structure)
 # ==============================================================================
 
 # ==============================================================================
@@ -19,22 +20,17 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0
 METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 
 # ==============================================================================
-# 2. MARCHÉS
+# 2. MARCHÉS — 1 indice + Gold
 # ==============================================================================
 
-STOCH_SYMBOLS = [
-    "Step Index",
-]
-
-OB_SYMBOLS = [
-    "XAUUSD",
-]
+STOCH_SYMBOLS = ["Step Index"]
+OB_SYMBOLS = ["XAUUSD"]
 
 TIMEFRAME_ANALYSIS = "1h"
 TIMEFRAME_ENTRY = "15m"
 
 # ==============================================================================
-# 3. STOCHASTIQUE — TA RECETTE ORIGINALE
+# 3. STOCHASTIQUE (Step Index) — ta recette originale
 # ==============================================================================
 
 STOCH_K = 5
@@ -47,7 +43,6 @@ H1_SELL_ZONE = 80
 ALERT_OVERBOUGHT = 85
 ALERT_OVERSOLD = 15
 
-# ✅ TA RECETTE (inchangée)
 ATR_PERIOD_STOCH = 14
 ATR_SL_MULTIPLIER_STOCH = 3.0
 ATR_TRAIL_MULTIPLIER_STOCH = 1.0
@@ -57,25 +52,19 @@ RISK_REWARD_RATIO_STOCH = 2.0
 
 LOT_PER_STOCH_SYMBOL = {
     "Step Index": 0.1,
-    "Volatility 100 Index": 1.0,
-    "Volatility 25 Index": 0.5,
 }
 
 MAX_SPREAD = {
     "Step Index": 2.0,
-    "Volatility 100 Index": 150.0,
-    "Volatility 25 Index": 50.0,
     "XAUUSD": 5.0,
 }
 
 DEFAULT_SL_POINTS = {
     "Step Index": 50.0,
-    "Volatility 100 Index": 700.0,
-    "Volatility 25 Index": 200.0,
 }
 
 # ==============================================================================
-# 4. ORDER BLOCKS — Paramètres FluxCharts
+# 4. ORDER BLOCKS — Paramètres
 # ==============================================================================
 
 SWING_LEN = 5
@@ -104,23 +93,30 @@ TRAILING_START_R_OB = 1.5
 TRAILING_DISTANCE_R_OB = 0.7
 
 # ==============================================================================
-# 4bis. LIQUIDITÉ ET INVALIDATION OB
+# 4bis. INVALIDATION + SL INTELLIGENT
 # ==============================================================================
 
-MIN_TOUCHES_LIQUIDITY = 3
-MIN_VOLUME_RATIO_LIQUIDITY = 1.2
-MIN_LIQUIDITY_SCORE = 2
+# ✅ Filtre liquidité DÉSACTIVÉ (0 = désactivé)
+MIN_LIQUIDITY_SCORE = 0
 
 MAX_ORDER_AGE_HOURS = 4
 MAX_DISTANCE_FACTOR = 3.0
 SWEEP_DETECTION_ENABLED = True
 
+# Buffer anti-sweep sur le SL
 SL_LIQUIDITY_BUFFER_FACTOR = {
-    "XAUUSD": 0.7,
+    "XAUUSD": 0.5,
 }
 
 SL_MIN_BUFFER_POINTS = {
-    "XAUUSD": 3.0,
+    "XAUUSD": 2.0,
+}
+
+# SL intelligent : sous le swing low / au-dessus du swing high
+SL_USE_STRUCTURE = True
+SL_STRUCTURE_LOOKBACK = 20
+SL_STRUCTURE_MARGIN_POINTS = {
+    "XAUUSD": 2.0,
 }
 
 # ==============================================================================
@@ -371,7 +367,63 @@ def can_modify_sl(spec, current, new_sl, digits):
     return abs(current - new_sl) >= md
 
 # ==============================================================================
-# 16. GESTION POSITIONS STOCH — TA RECETTE
+# 16. SL INTELLIGENT (buffer + structure)
+# ==============================================================================
+
+def find_swing_low_recent(candles, lookback=SL_STRUCTURE_LOOKBACK):
+    if not candles or len(candles) < lookback:
+        return None
+    recent = candles[-lookback:]
+    lows = [float(c["low"]) for c in recent]
+    return min(lows)
+
+def find_swing_high_recent(candles, lookback=SL_STRUCTURE_LOOKBACK):
+    if not candles or len(candles) < lookback:
+        return None
+    recent = candles[-lookback:]
+    highs = [float(c["high"]) for c in recent]
+    return max(highs)
+
+def calculate_sl_intelligent(candles_m15, spec, symbol, zone, is_bull):
+    digits = int(spec.get("digits", 5))
+    zone_size = zone["top"] - zone["bottom"]
+    if zone_size <= 0:
+        return None
+
+    buffer_factor = SL_LIQUIDITY_BUFFER_FACTOR.get(symbol, 0.5)
+    min_buffer = SL_MIN_BUFFER_POINTS.get(symbol, 0.0)
+    buffer = max(zone_size * buffer_factor, min_buffer)
+
+    if is_bull:
+        sl_buffer = zone["bottom"] - buffer
+        if SL_USE_STRUCTURE:
+            swing_low = find_swing_low_recent(candles_m15)
+            if swing_low is not None:
+                margin = SL_STRUCTURE_MARGIN_POINTS.get(symbol, 1.0)
+                sl_structure = swing_low - margin
+            else:
+                sl_structure = sl_buffer
+            sl_final = min(sl_buffer, sl_structure)
+        else:
+            sl_final = sl_buffer
+        return normalize_price(sl_final, digits)
+
+    else:
+        sl_buffer = zone["top"] + buffer
+        if SL_USE_STRUCTURE:
+            swing_high = find_swing_high_recent(candles_m15)
+            if swing_high is not None:
+                margin = SL_STRUCTURE_MARGIN_POINTS.get(symbol, 1.0)
+                sl_structure = swing_high + margin
+            else:
+                sl_structure = sl_buffer
+            sl_final = max(sl_buffer, sl_structure)
+        else:
+            sl_final = sl_buffer
+        return normalize_price(sl_final, digits)
+
+# ==============================================================================
+# 17. GESTION POSITIONS STOCH
 # ==============================================================================
 
 async def manage_open_positions_stoch(account, connection, symbol):
@@ -422,8 +474,6 @@ async def manage_open_positions_stoch(account, connection, symbol):
                     state["alerted"] = True
 
                 profit = bid - open_price
-
-                # ✅ BE à +1R (ta recette)
                 if profit >= ir * BREAK_EVEN_TRIGGER_R_STOCH and current_sl < open_price:
                     be_sl = normalize_price(open_price + min_distance, digits) if min_distance > 0 else open_price
                     log(f"🛡️ [{symbol}] +1R → BE BUY #{pos_id} SL={be_sl}")
@@ -431,7 +481,6 @@ async def manage_open_positions_stoch(account, connection, symbol):
                     current_sl = be_sl
                     state["r_reached"] = True
 
-                # ✅ Trailing ATR × 1.0 (ta recette)
                 if state["r_reached"] and atr_m15 and atr_m15 > 0:
                     new_sl = normalize_price(bid - atr_m15 * ATR_TRAIL_MULTIPLIER_STOCH, digits)
                     step_min = atr_m15 * ATR_MIN_TRAIL_STEP_STOCH
@@ -440,7 +489,6 @@ async def manage_open_positions_stoch(account, connection, symbol):
                         await connection.modify_position(pos_id, stop_loss=new_sl, take_profit=current_tp)
                         current_sl = new_sl
 
-                # ✅ Sortie retournement
                 if detect_bullish_reversal(candles_m15, stoch_m15):
                     log(f"🔴 [{symbol}] Retournement → Fermeture BUY #{pos_id}")
                     await connection.close_position(pos_id)
@@ -453,7 +501,6 @@ async def manage_open_positions_stoch(account, connection, symbol):
                     state["alerted"] = True
 
                 profit = open_price - ask
-
                 if profit >= ir * BREAK_EVEN_TRIGGER_R_STOCH and (current_sl > open_price or current_sl == 0):
                     be_sl = normalize_price(open_price - min_distance, digits) if min_distance > 0 else open_price
                     log(f"🛡️ [{symbol}] +1R → BE SELL #{pos_id} SL={be_sl}")
@@ -474,12 +521,11 @@ async def manage_open_positions_stoch(account, connection, symbol):
                     await connection.close_position(pos_id)
                     reset_position_state(symbol)
                     continue
-
     except Exception as e:
         log(f"❌ [{symbol}] Erreur gestion Stoch : {e}")
 
 # ==============================================================================
-# 17. ANALYSE STOCH — TA RECETTE
+# 18. ANALYSE STOCH
 # ==============================================================================
 
 async def analyze_stoch(account, connection, symbol):
@@ -492,12 +538,10 @@ async def analyze_stoch(account, connection, symbol):
 
         positions = await connection.get_positions()
         active = [p for p in positions if p.get("symbol") == symbol]
-
         if len(active) >= 1:
             await manage_open_positions_stoch(account, connection, symbol)
             return
 
-        # Filtre H1
         candles_h1 = await get_candles(account, symbol, TIMEFRAME_ANALYSIS)
         stoch_h1 = calculate_stochastic(candles_h1, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_h1:
@@ -515,7 +559,6 @@ async def analyze_stoch(account, connection, symbol):
 
         log(f"🎯 [{symbol}] H1 zone OK : K={h1_k:.1f} D={h1_d:.1f}")
 
-        # Confirmation M15 + Momentum
         candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
@@ -539,27 +582,20 @@ async def analyze_stoch(account, connection, symbol):
 
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
-        spread = ask - bid
-
-        if spread > MAX_SPREAD.get(symbol, 999.0):
-            log(f"🚫 [{symbol}] Spread trop élevé ({spread:.2f})")
+        if (ask - bid) > MAX_SPREAD.get(symbol, 999.0):
+            log(f"🚫 [{symbol}] Spread trop élevé")
             return
 
         atr_m15 = calculate_atr(candles_m15, ATR_PERIOD_STOCH)
         if not atr_m15 or atr_m15 <= 0:
-            log(f"⚠️ [{symbol}] ATR indisponible")
             return
 
         if buy_confirmed and not structure_confirms_buy(candles_m15, ask):
-            log(f"🚫 [{symbol}] Structure prix invalide BUY")
             return
         if sell_confirmed and not structure_confirms_sell(candles_m15, bid):
-            log(f"🚫 [{symbol}] Structure prix invalide SELL")
             return
 
         volume = get_fixed_lot_stoch(symbol, spec)
-
-        # ✅ SL = ATR × 3 | TP = 2R (ta recette)
         sl_distance = atr_m15 * ATR_SL_MULTIPLIER_STOCH
         tp_distance = sl_distance * RISK_REWARD_RATIO_STOCH
 
@@ -570,9 +606,7 @@ async def analyze_stoch(account, connection, symbol):
 
             log(f"🚀 [{symbol}] ACHAT | Entry={ask} | SL={sl_price} | TP={tp_price} | Vol={volume}")
             try:
-                await connection.create_market_buy_order(
-                    symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price
-                )
+                await connection.create_market_buy_order(symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price)
                 log(f"✅ [{symbol}] ACHAT exécuté")
                 LAST_SIGNAL[symbol] = "BUY"
                 reset_position_state(symbol)
@@ -586,20 +620,17 @@ async def analyze_stoch(account, connection, symbol):
 
             log(f"🔻 [{symbol}] VENTE | Entry={bid} | SL={sl_price} | TP={tp_price} | Vol={volume}")
             try:
-                await connection.create_market_sell_order(
-                    symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price
-                )
+                await connection.create_market_sell_order(symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price)
                 log(f"✅ [{symbol}] VENTE exécutée")
                 LAST_SIGNAL[symbol] = "SELL"
                 reset_position_state(symbol)
             except Exception as e:
                 log(f"❌ [{symbol}] VENTE erreur : {e}")
-
     except Exception as e:
         log(f"❌ [{symbol}] Erreur analyse Stoch : {e}")
 
 # ==============================================================================
-# 18. ORDER BLOCK — SWINGS + BOS
+# 19. ORDER BLOCK — SWINGS + BOS
 # ==============================================================================
 
 def find_swing_highs_lows(candles, swing_len):
@@ -632,7 +663,7 @@ def detect_bos(candles, swing_highs, swing_lows):
     return bos_list
 
 # ==============================================================================
-# 19. POC
+# 20. POC
 # ==============================================================================
 
 def find_poc(candles, from_idx, to_idx, n_bins=POC_BINS):
@@ -700,7 +731,7 @@ def find_best_poc_candle(candles, from_idx, to_idx, poc, is_bull):
     return best_idx
 
 # ==============================================================================
-# 20. GAP + OVERLAP
+# 21. GAP + OVERLAP
 # ==============================================================================
 
 def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
@@ -716,8 +747,7 @@ def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
         if is_bull:
             if now_lo > prev_hi: return True
         else:
-            if now_hi < prev_lo: return True
-    return False
+            if now_hi < prev_lo: return True    return False
 
 def ob_overlaps_active(zones, top, bottom):
     z_top = max(top, bottom)
@@ -732,28 +762,8 @@ def ob_overlaps_active(zones, top, bottom):
     return False
 
 # ==============================================================================
-# 21. LIQUIDITÉ
+# 22. SWEEP (invalidation)
 # ==============================================================================
-
-def calculate_liquidity_score(candles, anchor_idx, from_idx, to_idx, poc):
-    score = 0
-    volumes_in_range = [float(c.get("volume", 0) or 0) for c in candles[from_idx:to_idx + 1]]
-    avg_vol = sum(volumes_in_range) / len(volumes_in_range) if volumes_in_range else 0
-    poc_volumes = []
-    for i in range(from_idx, to_idx + 1):
-        lo = float(candles[i]["low"])
-        hi = float(candles[i]["high"])
-        if lo <= poc <= hi:
-            poc_volumes.append(float(candles[i].get("volume", 0) or 0))
-    poc_avg_vol = sum(poc_volumes) / len(poc_volumes) if poc_volumes else 0
-    if avg_vol > 0 and poc_avg_vol >= avg_vol * MIN_VOLUME_RATIO_LIQUIDITY:
-        score += 1
-    if len(poc_volumes) >= MIN_TOUCHES_LIQUIDITY:
-        score += 1
-    anchor_vol = float(candles[anchor_idx].get("volume", 0) or 0)
-    if avg_vol > 0 and anchor_vol >= avg_vol:
-        score += 1
-    return score
 
 def detect_liquidity_sweep(candles, zone):
     if len(candles) < 2:
@@ -773,7 +783,7 @@ def detect_liquidity_sweep(candles, zone):
     return False
 
 # ==============================================================================
-# 22. CRÉATION ZONE OB POC
+# 23. CRÉATION ZONE OB POC (sans filtre liquidité)
 # ==============================================================================
 
 def create_ob_zone_poc(candles, bos, existing_zones):
@@ -799,10 +809,8 @@ def create_ob_zone_poc(candles, bos, existing_zones):
         return None
     if OVERLAP_FILTER_ENABLED and ob_overlaps_active(existing_zones, top, bottom):
         return None
-    liquidity = calculate_liquidity_score(candles, anchor_idx, swing_idx, bos_idx, poc)
-    if liquidity < MIN_LIQUIDITY_SCORE:
-        log(f"⏭️ Liquidité insuffisante ({liquidity}/3) — zone refusée")
-        return None
+    # ✅ Liquidité désactivée
+    liquidity = 3
     quality = calculate_quality_score(candles, bos, anchor_idx, top, bottom)
     return {
         "type": bos["type"], "top": top, "bottom": bottom,
@@ -853,7 +861,7 @@ def calculate_quality_score(candles, bos, anchor_idx, top, bottom):
     return score
 
 # ==============================================================================
-# 23. MISE À JOUR ZONES
+# 24. MISE À JOUR ZONES
 # ==============================================================================
 
 def update_zones(candles, zones, symbol):
@@ -875,7 +883,7 @@ def update_zones(candles, zones, symbol):
     return zones
 
 # ==============================================================================
-# 24. VOLUME OB
+# 25. VOLUME OB
 # ==============================================================================
 
 async def calculate_volume_ob(connection, symbol, entry, sl):
@@ -914,27 +922,21 @@ async def count_active_limit_orders(connection, symbol):
         return 999
 
 # ==============================================================================
-# 25. PLACEMENT ORDRE LIMIT — BUFFER ANTI-LIQUIDITÉ
+# 26. PLACEMENT ORDRE LIMIT — SL INTELLIGENT
 # ==============================================================================
 
-async def place_limit_order_ob(connection, symbol, zone):
+async def place_limit_order_ob(connection, symbol, zone, candles_m15):
     try:
         price = await connection.get_symbol_price(symbol)
         bid, ask = float(price["bid"]), float(price["ask"])
         spec = await connection.get_symbol_specification(symbol)
         digits = int(spec.get("digits", 5))
 
-        zone_size = zone["top"] - zone["bottom"]
-        if zone_size <= 0:
-            return None
-
-        buffer_factor = SL_LIQUIDITY_BUFFER_FACTOR.get(symbol, 0.5)
-        min_buffer = SL_MIN_BUFFER_POINTS.get(symbol, 0.0)
-        buffer = max(zone_size * buffer_factor, min_buffer)
-
         if zone["type"] == "BULL":
             entry = normalize_price(zone["top"], digits)
-            sl = normalize_price(zone["bottom"] - buffer, digits)
+            sl = calculate_sl_intelligent(candles_m15, spec, symbol, zone, True)
+            if sl is None:
+                return None
             if ask <= entry:
                 return None
             risk = entry - sl
@@ -943,7 +945,9 @@ async def place_limit_order_ob(connection, symbol, zone):
             tp = normalize_price(entry + risk * RR_RATIO_OB, digits)
         else:
             entry = normalize_price(zone["bottom"], digits)
-            sl = normalize_price(zone["top"] + buffer, digits)
+            sl = calculate_sl_intelligent(candles_m15, spec, symbol, zone, False)
+            if sl is None:
+                return None
             if bid >= entry:
                 return None
             risk = sl - entry
@@ -957,7 +961,7 @@ async def place_limit_order_ob(connection, symbol, zone):
 
         log(f"🟢 [{symbol}] {'BUY' if zone['type']=='BULL' else 'SELL'} LIMIT | "
             f"Entry={entry} | SL={sl} | TP={tp} | Vol={volume} | "
-            f"Score={zone['quality_score']}/7 | Liq={zone.get('liquidity_score')}/3")
+            f"Score={zone['quality_score']}/7")
 
         if zone["type"] == "BULL":
             order = await connection.create_limit_buy_order(symbol=symbol, volume=volume, open_price=entry, stop_loss=sl, take_profit=tp)
@@ -972,7 +976,7 @@ async def place_limit_order_ob(connection, symbol, zone):
         return None
 
 # ==============================================================================
-# 26. CLEANUP ZONES
+# 27. CLEANUP ZONES
 # ==============================================================================
 
 async def cleanup_zones(connection, symbol):
@@ -990,7 +994,7 @@ async def cleanup_zones(connection, symbol):
         pass
 
 # ==============================================================================
-# 27. INVALIDATION DES ORDRES LIMIT
+# 28. INVALIDATION DES ORDRES LIMIT
 # ==============================================================================
 
 async def invalidate_limit_orders(connection, symbol, zones, candles):
@@ -1073,7 +1077,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
         log(f"❌ [{symbol}] Erreur invalidation : {e}")
 
 # ==============================================================================
-# 28. GESTION POSITIONS OB
+# 29. GESTION POSITIONS OB
 # ==============================================================================
 
 async def manage_positions_ob(connection):
@@ -1133,7 +1137,7 @@ async def manage_positions_ob(connection):
         log(f"Erreur OB globale : {e}")
 
 # ==============================================================================
-# 29. ANALYSE OB
+# 30. ANALYSE OB
 # ==============================================================================
 
 async def analyze_ob(account, connection, symbol):
@@ -1158,7 +1162,7 @@ async def analyze_ob(account, connection, symbol):
             if any(zz.get("anchor_index") == z["anchor_index"] and zz["type"] == z["type"] for zz in ob_zones[symbol]):
                 continue
             ob_zones[symbol].append(z)
-            log(f"🆕 [{symbol}] Zone OB POC {z['type']} top={z['top']} bot={z['bottom']} POC={z.get('poc')} score={z['quality_score']}/7 liq={z['liquidity_score']}/3")
+            log(f"🆕 [{symbol}] Zone OB POC {z['type']} top={z['top']} bot={z['bottom']} score={z['quality_score']}/7")
 
         ob_zones[symbol] = update_zones(candles, ob_zones[symbol], symbol)
         active = [z for z in ob_zones[symbol] if z["active"]]
@@ -1179,14 +1183,14 @@ async def analyze_ob(account, connection, symbol):
                 break
             if z.get("order_placed", False):
                 continue
-            r = await place_limit_order_ob(connection, symbol, z)
+            r = await place_limit_order_ob(connection, symbol, z, candles)
             if r is not None:
                 n_orders += 1
     except Exception as e:
         log(f"❌ [{symbol}] Erreur analyse OB : {e}")
 
 # ==============================================================================
-# 30. HEALTH CHECK
+# 31. HEALTH CHECK
 # ==============================================================================
 
 async def health_check_server():
@@ -1212,7 +1216,7 @@ async def health_check_server():
         await server.serve_forever()
 
 # ==============================================================================
-# 31. BOUCLE
+# 32. BOUCLE
 # ==============================================================================
 
 async def trading_loop(account, connection):
@@ -1231,18 +1235,17 @@ async def trading_loop(account, connection):
             await asyncio.sleep(10)
 
 # ==============================================================================
-# 32. MAIN
+# 33. MAIN
 # ==============================================================================
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS BOT — TA RECETTE (Stoch) + OB POC LIQUIDITÉ", flush=True)
+    print("🚀 ARKAS BOT — Step Index + XAUUSD", flush=True)
     print("=" * 60, flush=True)
     print(f"STOCH : {', '.join(STOCH_SYMBOLS)}", flush=True)
     print(f"OB    : {', '.join(OB_SYMBOLS)}", flush=True)
-    print(f"H1 : BUY≤{H1_BUY_ZONE} / SELL≥{H1_SELL_ZONE}", flush=True)
-    print(f"SL : ATR × {ATR_SL_MULTIPLIER_STOCH} | TP : {RISK_REWARD_RATIO_STOCH}R", flush=True)
-    print(f"BE : +{BREAK_EVEN_TRIGGER_R_STOCH}R | Trailing : ATR × {ATR_TRAIL_MULTIPLIER_STOCH}", flush=True)
+    print(f"Liquidité OB : DÉSACTIVÉE", flush=True)
+    print(f"SL OB : buffer + swing structurel", flush=True)
     print(f"Région : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
