@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks)
-# Liquidité désactivée + SL intelligent (buffer + structure)
+# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks technique pure)
+# Ordres LIMIT | SL = bord zone | TP = 2R | BE +1R | Trailing 1.5R
 # ==============================================================================
 
 # ==============================================================================
@@ -30,7 +30,7 @@ TIMEFRAME_ANALYSIS = "1h"
 TIMEFRAME_ENTRY = "15m"
 
 # ==============================================================================
-# 3. STOCHASTIQUE (Step Index) — ta recette originale
+# 3. STOCHASTIQUE (Step Index)
 # ==============================================================================
 
 STOCH_K = 5
@@ -64,7 +64,7 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 4. ORDER BLOCKS — Paramètres
+# 4. ORDER BLOCKS — Technique pure
 # ==============================================================================
 
 SWING_LEN = 5
@@ -93,31 +93,27 @@ TRAILING_START_R_OB = 1.5
 TRAILING_DISTANCE_R_OB = 0.7
 
 # ==============================================================================
-# 4bis. INVALIDATION + SL INTELLIGENT
+# 4bis. INVALIDATION + SL TECHNIQUE OB PURE
 # ==============================================================================
 
-# ✅ Filtre liquidité DÉSACTIVÉ (0 = désactivé)
-MIN_LIQUIDITY_SCORE = 0
+MIN_LIQUIDITY_SCORE = 0        # Filtre liquidité désactivé
 
 MAX_ORDER_AGE_HOURS = 4
 MAX_DISTANCE_FACTOR = 3.0
 SWEEP_DETECTION_ENABLED = True
 
-# Buffer anti-sweep sur le SL
+# ✅ SL = bord opposé de la zone (technique OB pure)
 SL_LIQUIDITY_BUFFER_FACTOR = {
-    "XAUUSD": 0.5,
+    "XAUUSD": 0.0,
 }
 
 SL_MIN_BUFFER_POINTS = {
-    "XAUUSD": 2.0,
+    "XAUUSD": 0.0,
 }
 
-# SL intelligent : sous le swing low / au-dessus du swing high
-SL_USE_STRUCTURE = True
+SL_USE_STRUCTURE = False       # SL structurel désactivé
 SL_STRUCTURE_LOOKBACK = 20
-SL_STRUCTURE_MARGIN_POINTS = {
-    "XAUUSD": 2.0,
-}
+SL_STRUCTURE_MARGIN_POINTS = {}
 
 # ==============================================================================
 # 5. EXECUTION
@@ -367,63 +363,7 @@ def can_modify_sl(spec, current, new_sl, digits):
     return abs(current - new_sl) >= md
 
 # ==============================================================================
-# 16. SL INTELLIGENT (buffer + structure)
-# ==============================================================================
-
-def find_swing_low_recent(candles, lookback=SL_STRUCTURE_LOOKBACK):
-    if not candles or len(candles) < lookback:
-        return None
-    recent = candles[-lookback:]
-    lows = [float(c["low"]) for c in recent]
-    return min(lows)
-
-def find_swing_high_recent(candles, lookback=SL_STRUCTURE_LOOKBACK):
-    if not candles or len(candles) < lookback:
-        return None
-    recent = candles[-lookback:]
-    highs = [float(c["high"]) for c in recent]
-    return max(highs)
-
-def calculate_sl_intelligent(candles_m15, spec, symbol, zone, is_bull):
-    digits = int(spec.get("digits", 5))
-    zone_size = zone["top"] - zone["bottom"]
-    if zone_size <= 0:
-        return None
-
-    buffer_factor = SL_LIQUIDITY_BUFFER_FACTOR.get(symbol, 0.5)
-    min_buffer = SL_MIN_BUFFER_POINTS.get(symbol, 0.0)
-    buffer = max(zone_size * buffer_factor, min_buffer)
-
-    if is_bull:
-        sl_buffer = zone["bottom"] - buffer
-        if SL_USE_STRUCTURE:
-            swing_low = find_swing_low_recent(candles_m15)
-            if swing_low is not None:
-                margin = SL_STRUCTURE_MARGIN_POINTS.get(symbol, 1.0)
-                sl_structure = swing_low - margin
-            else:
-                sl_structure = sl_buffer
-            sl_final = min(sl_buffer, sl_structure)
-        else:
-            sl_final = sl_buffer
-        return normalize_price(sl_final, digits)
-
-    else:
-        sl_buffer = zone["top"] + buffer
-        if SL_USE_STRUCTURE:
-            swing_high = find_swing_high_recent(candles_m15)
-            if swing_high is not None:
-                margin = SL_STRUCTURE_MARGIN_POINTS.get(symbol, 1.0)
-                sl_structure = swing_high + margin
-            else:
-                sl_structure = sl_buffer
-            sl_final = max(sl_buffer, sl_structure)
-        else:
-            sl_final = sl_buffer
-        return normalize_price(sl_final, digits)
-
-# ==============================================================================
-# 17. GESTION POSITIONS STOCH
+# 16. GESTION POSITIONS STOCH
 # ==============================================================================
 
 async def manage_open_positions_stoch(account, connection, symbol):
@@ -525,7 +465,7 @@ async def manage_open_positions_stoch(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur gestion Stoch : {e}")
 
 # ==============================================================================
-# 18. ANALYSE STOCH
+# 17. ANALYSE STOCH
 # ==============================================================================
 
 async def analyze_stoch(account, connection, symbol):
@@ -630,7 +570,7 @@ async def analyze_stoch(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur analyse Stoch : {e}")
 
 # ==============================================================================
-# 19. ORDER BLOCK — SWINGS + BOS
+# 18. ORDER BLOCK — SWINGS + BOS
 # ==============================================================================
 
 def find_swing_highs_lows(candles, swing_len):
@@ -663,7 +603,7 @@ def detect_bos(candles, swing_highs, swing_lows):
     return bos_list
 
 # ==============================================================================
-# 20. POC
+# 19. POC
 # ==============================================================================
 
 def find_poc(candles, from_idx, to_idx, n_bins=POC_BINS):
@@ -731,7 +671,7 @@ def find_best_poc_candle(candles, from_idx, to_idx, poc, is_bull):
     return best_idx
 
 # ==============================================================================
-# 21. GAP + OVERLAP
+# 20. GAP + OVERLAP
 # ==============================================================================
 
 def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
@@ -745,9 +685,12 @@ def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
         now_hi = float(candles[i]["high"])
         now_lo = float(candles[i]["low"])
         if is_bull:
-            if now_lo > prev_hi: return True
+            if now_lo > prev_hi:
+                return True
         else:
-            if now_hi < prev_lo: return True    return False
+            if now_hi < prev_lo:
+                return True
+    return False
 
 def ob_overlaps_active(zones, top, bottom):
     z_top = max(top, bottom)
@@ -762,7 +705,7 @@ def ob_overlaps_active(zones, top, bottom):
     return False
 
 # ==============================================================================
-# 22. SWEEP (invalidation)
+# 21. SWEEP (invalidation)
 # ==============================================================================
 
 def detect_liquidity_sweep(candles, zone):
@@ -783,7 +726,7 @@ def detect_liquidity_sweep(candles, zone):
     return False
 
 # ==============================================================================
-# 23. CRÉATION ZONE OB POC (sans filtre liquidité)
+# 22. CRÉATION ZONE OB POC
 # ==============================================================================
 
 def create_ob_zone_poc(candles, bos, existing_zones):
@@ -809,7 +752,6 @@ def create_ob_zone_poc(candles, bos, existing_zones):
         return None
     if OVERLAP_FILTER_ENABLED and ob_overlaps_active(existing_zones, top, bottom):
         return None
-    # ✅ Liquidité désactivée
     liquidity = 3
     quality = calculate_quality_score(candles, bos, anchor_idx, top, bottom)
     return {
@@ -861,7 +803,7 @@ def calculate_quality_score(candles, bos, anchor_idx, top, bottom):
     return score
 
 # ==============================================================================
-# 24. MISE À JOUR ZONES
+# 23. MISE À JOUR ZONES
 # ==============================================================================
 
 def update_zones(candles, zones, symbol):
@@ -883,7 +825,7 @@ def update_zones(candles, zones, symbol):
     return zones
 
 # ==============================================================================
-# 25. VOLUME OB
+# 24. VOLUME OB
 # ==============================================================================
 
 async def calculate_volume_ob(connection, symbol, entry, sl):
@@ -922,7 +864,7 @@ async def count_active_limit_orders(connection, symbol):
         return 999
 
 # ==============================================================================
-# 26. PLACEMENT ORDRE LIMIT — SL INTELLIGENT
+# 25. PLACEMENT ORDRE LIMIT — TECHNIQUE OB PURE
 # ==============================================================================
 
 async def place_limit_order_ob(connection, symbol, zone, candles_m15):
@@ -934,9 +876,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
 
         if zone["type"] == "BULL":
             entry = normalize_price(zone["top"], digits)
-            sl = calculate_sl_intelligent(candles_m15, spec, symbol, zone, True)
-            if sl is None:
-                return None
+            sl = normalize_price(zone["bottom"], digits)
             if ask <= entry:
                 return None
             risk = entry - sl
@@ -945,9 +885,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
             tp = normalize_price(entry + risk * RR_RATIO_OB, digits)
         else:
             entry = normalize_price(zone["bottom"], digits)
-            sl = calculate_sl_intelligent(candles_m15, spec, symbol, zone, False)
-            if sl is None:
-                return None
+            sl = normalize_price(zone["top"], digits)
             if bid >= entry:
                 return None
             risk = sl - entry
@@ -955,18 +893,26 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
                 return None
             tp = normalize_price(entry - risk * RR_RATIO_OB, digits)
 
+        entry, sl, tp = validate_stops(spec, entry, sl, tp, digits)
+
         volume = await calculate_volume_ob(connection, symbol, entry, sl)
         if not volume or volume <= 0:
             return None
 
-        log(f"🟢 [{symbol}] {'BUY' if zone['type']=='BULL' else 'SELL'} LIMIT | "
+        log(f"📋 [{symbol}] {'BUY' if zone['type']=='BULL' else 'SELL'} LIMIT OB | "
             f"Entry={entry} | SL={sl} | TP={tp} | Vol={volume} | "
             f"Score={zone['quality_score']}/7")
 
         if zone["type"] == "BULL":
-            order = await connection.create_limit_buy_order(symbol=symbol, volume=volume, open_price=entry, stop_loss=sl, take_profit=tp)
+            order = await connection.create_limit_buy_order(
+                symbol=symbol, volume=volume, open_price=entry,
+                stop_loss=sl, take_profit=tp
+            )
         else:
-            order = await connection.create_limit_sell_order(symbol=symbol, volume=volume, open_price=entry, stop_loss=sl, take_profit=tp)
+            order = await connection.create_limit_sell_order(
+                symbol=symbol, volume=volume, open_price=entry,
+                stop_loss=sl, take_profit=tp
+            )
 
         zone["order_placed"] = True
         zone["order_id"] = order.get("orderId") if isinstance(order, dict) else order
@@ -976,7 +922,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
         return None
 
 # ==============================================================================
-# 27. CLEANUP ZONES
+# 26. CLEANUP ZONES
 # ==============================================================================
 
 async def cleanup_zones(connection, symbol):
@@ -994,7 +940,7 @@ async def cleanup_zones(connection, symbol):
         pass
 
 # ==============================================================================
-# 28. INVALIDATION DES ORDRES LIMIT
+# 27. INVALIDATION DES ORDRES LIMIT
 # ==============================================================================
 
 async def invalidate_limit_orders(connection, symbol, zones, candles):
@@ -1077,7 +1023,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
         log(f"❌ [{symbol}] Erreur invalidation : {e}")
 
 # ==============================================================================
-# 29. GESTION POSITIONS OB
+# 28. GESTION POSITIONS OB — BE + Trailing
 # ==============================================================================
 
 async def manage_positions_ob(connection):
@@ -1137,7 +1083,7 @@ async def manage_positions_ob(connection):
         log(f"Erreur OB globale : {e}")
 
 # ==============================================================================
-# 30. ANALYSE OB
+# 29. ANALYSE OB
 # ==============================================================================
 
 async def analyze_ob(account, connection, symbol):
@@ -1190,7 +1136,7 @@ async def analyze_ob(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur analyse OB : {e}")
 
 # ==============================================================================
-# 31. HEALTH CHECK
+# 30. HEALTH CHECK
 # ==============================================================================
 
 async def health_check_server():
@@ -1216,7 +1162,7 @@ async def health_check_server():
         await server.serve_forever()
 
 # ==============================================================================
-# 32. BOUCLE
+# 31. BOUCLE
 # ==============================================================================
 
 async def trading_loop(account, connection):
@@ -1235,17 +1181,17 @@ async def trading_loop(account, connection):
             await asyncio.sleep(10)
 
 # ==============================================================================
-# 33. MAIN
+# 32. MAIN
 # ==============================================================================
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS BOT — Step Index + XAUUSD", flush=True)
+    print("🚀 ARKAS BOT — Step Index + XAUUSD (OB technique pure)", flush=True)
     print("=" * 60, flush=True)
     print(f"STOCH : {', '.join(STOCH_SYMBOLS)}", flush=True)
     print(f"OB    : {', '.join(OB_SYMBOLS)}", flush=True)
-    print(f"Liquidité OB : DÉSACTIVÉE", flush=True)
-    print(f"SL OB : buffer + swing structurel", flush=True)
+    print(f"Entry OB : bord zone | SL : bord opposé | TP : 2R", flush=True)
+    print(f"Ordre OB : LIMIT", flush=True)
     print(f"Région : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
