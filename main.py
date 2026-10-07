@@ -7,7 +7,7 @@ from datetime import datetime
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — VERSION 4.0.3 (Region dans constructeur MetaApi)
+# ARKAS STOCHASTIC MTF BOT — VERSION 5.0 (Ordres LIMIT)
 # ==============================================================================
 
 # ==============================================================================
@@ -63,6 +63,7 @@ VOLUME_LIMITS = {
 }
 
 MAX_POSITIONS_PER_SYMBOL = 1
+MAX_ORDERS_PER_SYMBOL = 1
 
 DEFAULT_SL_POINTS = {
     "Step Index": 50.0,
@@ -70,7 +71,18 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 5. GESTION POSITION
+# 5. ORDRES LIMIT — Points d'entrée en retrait du prix actuel
+# ==============================================================================
+
+# Distance à laquelle on place l'ordre limit par rapport au prix actuel
+# (en multiple d'ATR M15)
+LIMIT_OFFSET_ATR = 0.5     # BUY_LIMIT = bid - ATR*0.5 | SELL_LIMIT = ask + ATR*0.5
+
+# Durée de vie de l'ordre limit (en secondes) — annulé après
+ORDER_EXPIRATION_SECONDS = 3600  # 1 heure
+
+# ==============================================================================
+# 6. GESTION POSITION
 # ==============================================================================
 
 ATR_PERIOD = 14
@@ -82,14 +94,14 @@ BREAK_EVEN_TRIGGER_R = 1.0
 RISK_REWARD_RATIO = 2.0
 
 # ==============================================================================
-# 6. EXECUTION
+# 7. EXECUTION
 # ==============================================================================
 
 SCAN_INTERVAL = 15
 CANDLES_LIMIT = 300
 
 # ==============================================================================
-# 7. SPREAD
+# 8. SPREAD
 # ==============================================================================
 
 MAX_SPREAD = {
@@ -98,7 +110,7 @@ MAX_SPREAD = {
 }
 
 # ==============================================================================
-# 8. ANTI-SPAM + ÉTAT
+# 9. ANTI-SPAM + ÉTAT
 # ==============================================================================
 
 LAST_TRADED_CANDLE = {}
@@ -113,7 +125,7 @@ def ensure_position_state(symbol):
     return POSITION_STATE[symbol]
 
 # ==============================================================================
-# 9. UTILS
+# 10. UTILS
 # ==============================================================================
 
 def log(message):
@@ -130,7 +142,7 @@ def normalize_volume(volume, minimum, maximum, step):
     return round(steps * step, 4)
 
 # ==============================================================================
-# 10. STOCHASTIQUE ALIGNÉ
+# 11. STOCHASTIQUE ALIGNÉ
 # ==============================================================================
 
 def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
@@ -162,7 +174,7 @@ def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
     return {"k": aligned_k, "d": d_line}
 
 # ==============================================================================
-# 11. ATR
+# 12. ATR
 # ==============================================================================
 
 def calculate_atr(candles, period=ATR_PERIOD):
@@ -182,7 +194,7 @@ def calculate_atr(candles, period=ATR_PERIOD):
     return sum(trs[-period:]) / period
 
 # ==============================================================================
-# 12. STRUCTURE
+# 13. STRUCTURE
 # ==============================================================================
 
 def detect_structure(candles, lookback=5):
@@ -248,7 +260,7 @@ def structure_confirms_sell(candles, current_price, lookback=5):
     return wick_rejection and below_swing
 
 # ==============================================================================
-# 13. RETOURNEMENTS
+# 14. RETOURNEMENTS
 # ==============================================================================
 
 def detect_bullish_reversal(candles_m15, stoch):
@@ -294,7 +306,7 @@ def detect_bearish_reversal(candles_m15, stoch):
     return False
 
 # ==============================================================================
-# 14. BOUGIES
+# 15. BOUGIES
 # ==============================================================================
 
 async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
@@ -308,7 +320,7 @@ async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
         return None
 
 # ==============================================================================
-# 15. VÉRIF SYMBOLE
+# 16. VÉRIF SYMBOLE
 # ==============================================================================
 
 async def is_symbol_tradable(connection, symbol):
@@ -325,7 +337,7 @@ async def is_symbol_tradable(connection, symbol):
         return False, None
 
 # ==============================================================================
-# 16. VOLUME
+# 17. VOLUME
 # ==============================================================================
 
 def get_fixed_lot(symbol, spec):
@@ -338,7 +350,7 @@ def get_fixed_lot(symbol, spec):
     return volume
 
 # ==============================================================================
-# 17. STOPS
+# 18. STOPS
 # ==============================================================================
 
 def get_min_stop_distance(spec, digits):
@@ -375,7 +387,55 @@ def can_modify_sl(spec, current_price, new_sl, digits):
     return abs(current_price - new_sl) >= min_distance
 
 # ==============================================================================
-# 18. GESTION POSITIONS
+# 19. GESTION DES ORDRES LIMIT EN ATTENTE (expiration)
+# ==============================================================================
+
+async def manage_pending_orders(connection, symbol):
+    """
+    Vérifie les ordres LIMIT en attente :
+    - Si l'ordre est trop vieux → on l'annule
+    """
+    try:
+        orders = await connection.get_orders()
+        symbol_orders = [o for o in orders if o.get("symbol") == symbol]
+
+        if not symbol_orders:
+            return
+
+        now = datetime.utcnow()
+
+        for order in symbol_orders:
+            order_id = order.get("id")
+            order_type = order.get("type")
+            created = order.get("time") or order.get("brokerTime")
+
+            if not created:
+                continue
+
+            try:
+                if isinstance(created, str):
+                    # Format ISO ou datetime string
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(tzinfo=None)
+                else:
+                    created_dt = created
+            except Exception:
+                continue
+
+            age = (now - created_dt).total_seconds()
+
+            if age > ORDER_EXPIRATION_SECONDS:
+                log(f"⏰ [{symbol}] Ordre {order_id} ({order_type}) expiré ({age:.0f}s) → annulation")
+                try:
+                    await connection.cancel_order(order_id)
+                    log(f"🗑️ [{symbol}] Ordre {order_id} annulé")
+                except Exception as e:
+                    log(f"⚠️ [{symbol}] Impossible d'annuler {order_id} : {e}")
+
+    except Exception as e:
+        log(f"❌ [{symbol}] Erreur gestion ordres : {e}")
+
+# ==============================================================================
+# 20. GESTION DES POSITIONS (BE + Trailing + Retournement)
 # ==============================================================================
 
 async def manage_open_positions(account, connection, symbol):
@@ -424,13 +484,13 @@ async def manage_open_positions(account, connection, symbol):
 
             if pos_type == "POSITION_TYPE_BUY":
                 if (curr_k >= ALERT_OVERBOUGHT or curr_d >= ALERT_OVERBOUGHT) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone haute ({curr_k:.1f}/{curr_d:.1f})")
+                    log(f"⚠️ [{symbol}] ALERTE Stoch M15 haute ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
                 profit = bid - open_price
                 if profit >= initial_risk * BREAK_EVEN_TRIGGER_R and current_sl < open_price:
                     be_sl = normalize_price(open_price + min_distance, digits) if min_distance > 0 else open_price
-                    log(f"🛡️ [{symbol}] +1R atteint → BE activé BUY #{pos_id} SL={be_sl}")
+                    log(f"🛡️ [{symbol}] +1R → BE BUY #{pos_id} SL={be_sl}")
                     await connection.modify_position(pos_id, stop_loss=be_sl, take_profit=current_tp)
                     current_sl = be_sl
                     state["r_reached"] = True
@@ -451,13 +511,13 @@ async def manage_open_positions(account, connection, symbol):
 
             elif pos_type == "POSITION_TYPE_SELL":
                 if (curr_k <= ALERT_OVERSOLD or curr_d <= ALERT_OVERSOLD) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE : Stoch M15 zone basse ({curr_k:.1f}/{curr_d:.1f})")
+                    log(f"⚠️ [{symbol}] ALERTE Stoch M15 basse ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
                 profit = open_price - ask
                 if profit >= initial_risk * BREAK_EVEN_TRIGGER_R and (current_sl > open_price or current_sl == 0):
                     be_sl = normalize_price(open_price - min_distance, digits) if min_distance > 0 else open_price
-                    log(f"🛡️ [{symbol}] +1R atteint → BE activé SELL #{pos_id} SL={be_sl}")
+                    log(f"🛡️ [{symbol}] +1R → BE SELL #{pos_id} SL={be_sl}")
                     await connection.modify_position(pos_id, stop_loss=be_sl, take_profit=current_tp)
                     current_sl = be_sl
                     state["r_reached"] = True
@@ -480,7 +540,7 @@ async def manage_open_positions(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur gestion positions : {e}")
 
 # ==============================================================================
-# 19. ANALYSE MTF
+# 21. ANALYSE MTF — PLACE DES ORDRES LIMIT
 # ==============================================================================
 
 async def analyze_and_trade(account, connection, symbol):
@@ -491,13 +551,28 @@ async def analyze_and_trade(account, connection, symbol):
 
         digits = int(spec.get("digits", 2))
 
+        # 1. Gestion des positions et ordres existants
         positions = await connection.get_positions()
-        active = [p for p in positions if p.get("symbol") == symbol]
+        active_positions = [p for p in positions if p.get("symbol") == symbol]
 
-        if len(active) >= MAX_POSITIONS_PER_SYMBOL:
+        if len(active_positions) >= MAX_POSITIONS_PER_SYMBOL:
             await manage_open_positions(account, connection, symbol)
+            # On gère aussi l'expiration des ordres limit
+            await manage_pending_orders(connection, symbol)
             return
 
+        orders = await connection.get_orders()
+        active_orders = [o for o in orders if o.get("symbol") == symbol]
+
+        # Gestion expiration des ordres limit existants
+        await manage_pending_orders(connection, symbol)
+
+        # Si on a déjà un ordre limit en attente, on ne place rien de plus
+        if len(active_orders) >= MAX_ORDERS_PER_SYMBOL:
+            log(f"⏸️ [{symbol}] Ordre limit déjà en attente — skip")
+            return
+
+        # 2. Analyse H1
         candles_h1 = await get_candles(account, symbol, TIMEFRAME_ANALYSIS)
         stoch_h1 = calculate_stochastic(candles_h1, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_h1:
@@ -510,6 +585,7 @@ async def analyze_and_trade(account, connection, symbol):
         if not (h1_buy_setup or h1_sell_setup):
             return
 
+        # 3. Analyse M15 — confirmation croisement
         candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
@@ -525,64 +601,91 @@ async def analyze_and_trade(account, connection, symbol):
         if not (buy_confirmed or sell_confirmed):
             return
 
+        # 4. Anti-spam M15
         last_candle_time = candles_m15[-1].get("time") or candles_m15[-1].get("brokerTime")
         if last_candle_time is None:
             return
         if LAST_TRADED_CANDLE.get(symbol) == last_candle_time:
             return
 
+        # 5. Prix + ATR
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
 
+        # 6. Structure de prix
         if buy_confirmed and not structure_confirms_buy(candles_m15, ask):
-            log(f"🚫 [{symbol}] Structure prix invalide pour BUY")
+            log(f"🚫 [{symbol}] Structure prix invalide BUY")
             return
         if sell_confirmed and not structure_confirms_sell(candles_m15, bid):
-            log(f"🚫 [{symbol}] Structure prix invalide pour SELL")
+            log(f"🚫 [{symbol}] Structure prix invalide SELL")
             return
 
+        # 7. Spread
         spread = ask - bid
         if spread > MAX_SPREAD.get(symbol, 999.0):
             log(f"🚫 [{symbol}] Spread trop élevé ({spread:.2f})")
             return
 
+        # 8. ATR et calcul du prix limite
         atr_m15 = calculate_atr(candles_m15, ATR_PERIOD)
-        sl_distance = atr_m15 * ATR_SL_MULTIPLIER if atr_m15 and atr_m15 > 0 else DEFAULT_SL_POINTS.get(symbol, 100.0)
-        tp_distance = sl_distance * RISK_REWARD_RATIO
+        if not atr_m15 or atr_m15 <= 0:
+            log(f"⚠️ [{symbol}] ATR indisponible — skip")
+            return
 
+        offset = atr_m15 * LIMIT_OFFSET_ATR
+
+        # 9. Volume
         volume = get_fixed_lot(symbol, spec)
 
         if buy_confirmed:
-            entry = ask
-            sl = normalize_price(entry - sl_distance, digits)
-            tp = normalize_price(entry + tp_distance, digits)
-            sl, tp = validate_stops(spec, entry, sl, tp, digits)
+            # BUY_LIMIT = prix actuel - offset (achat sur repli)
+            entry_price = normalize_price(bid - offset, digits)
+            sl_price = normalize_price(entry_price - atr_m15 * ATR_SL_MULTIPLIER, digits)
+            tp_price = normalize_price(entry_price + atr_m15 * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO, digits)
+            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
 
-            log(f"🚀 [{symbol}] ACHAT | Entry={entry} | SL={sl} | TP={tp} | Vol={volume}")
-            await connection.create_market_buy_order(
-                symbol=symbol, volume=volume, stop_loss=sl, take_profit=tp
-            )
-            LAST_TRADED_CANDLE[symbol] = last_candle_time
-            reset_position_state(symbol)
+            log(f"📋 [{symbol}] BUY_LIMIT | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+            try:
+                result = await connection.create_limit_buy_order(
+                    symbol=symbol,
+                    volume=volume,
+                    open_price=entry_price,
+                    stop_loss=sl_price,
+                    take_profit=tp_price
+                )
+                order_id = result.get("orderId") if isinstance(result, dict) else result
+                log(f"✅ [{symbol}] BUY_LIMIT placé | orderId={order_id}")
+                LAST_TRADED_CANDLE[symbol] = last_candle_time
+            except Exception as e:
+                log(f"❌ [{symbol}] BUY_LIMIT erreur : {e}")
 
         elif sell_confirmed:
-            entry = bid
-            sl = normalize_price(entry + sl_distance, digits)
-            tp = normalize_price(entry - tp_distance, digits)
-            sl, tp = validate_stops(spec, entry, sl, tp, digits)
+            # SELL_LIMIT = prix actuel + offset (vente sur rebond)
+            entry_price = normalize_price(ask + offset, digits)
+            sl_price = normalize_price(entry_price + atr_m15 * ATR_SL_MULTIPLIER, digits)
+            tp_price = normalize_price(entry_price - atr_m15 * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO, digits)
+            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
 
-            log(f"🔻 [{symbol}] VENTE | Entry={entry} | SL={sl} | TP={tp} | Vol={volume}")
-            await connection.create_market_sell_order(
-                symbol=symbol, volume=volume, stop_loss=sl, take_profit=tp
-            )
-            LAST_TRADED_CANDLE[symbol] = last_candle_time
-            reset_position_state(symbol)
+            log(f"📋 [{symbol}] SELL_LIMIT | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+            try:
+                result = await connection.create_limit_sell_order(
+                    symbol=symbol,
+                    volume=volume,
+                    open_price=entry_price,
+                    stop_loss=sl_price,
+                    take_profit=tp_price
+                )
+                order_id = result.get("orderId") if isinstance(result, dict) else result
+                log(f"✅ [{symbol}] SELL_LIMIT placé | orderId={order_id}")
+                LAST_TRADED_CANDLE[symbol] = last_candle_time
+            except Exception as e:
+                log(f"❌ [{symbol}] SELL_LIMIT erreur : {e}")
 
     except Exception as e:
         log(f"❌ [{symbol}] Erreur analyse/trading : {e}")
 
 # ==============================================================================
-# 20. MAIN — BOUCLE 24/7 + HEALTH CHECK HTTP POUR RENDER
+# 22. BOUCLE 24/7
 # ==============================================================================
 
 async def trading_loop(account, connection):
@@ -594,6 +697,10 @@ async def trading_loop(account, connection):
         except Exception as e:
             log(f"⚠️ Erreur boucle : {e}")
             await asyncio.sleep(10)
+
+# ==============================================================================
+# 23. HEALTH CHECK HTTP POUR RENDER
+# ==============================================================================
 
 async def health_check_server():
     port = int(os.getenv("PORT", 10000))
@@ -623,14 +730,19 @@ async def health_check_server():
     async with server:
         await server.serve_forever()
 
+# ==============================================================================
+# 24. MAIN
+# ==============================================================================
+
 async def main():
     print("==================================================", flush=True)
-    print("🚀 BOT STOCHASTIQUE MTF — VERSION 4.0.3", flush=True)
-    print("Mode : RENDER 24/7", flush=True)
+    print("🚀 BOT STOCHASTIQUE MTF — VERSION 5.0 (Ordres LIMIT)", flush=True)
     print("==================================================", flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
     print(f"Timeframes : {TIMEFRAME_ANALYSIS} → {TIMEFRAME_ENTRY}", flush=True)
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
+    print(f"Type d'ordre : LIMIT (retrait de {LIMIT_OFFSET_ATR}× ATR)", flush=True)
+    print(f"Expiration ordre : {ORDER_EXPIRATION_SECONDS}s", flush=True)
     print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}", flush=True)
     print(f"TP initial : {RISK_REWARD_RATIO}R", flush=True)
     print(f"Région MetaApi : {METAAPI_REGION}", flush=True)
@@ -641,22 +753,20 @@ async def main():
 
     asyncio.create_task(health_check_server())
 
-    # ✅ La région se passe à la création du client MetaApi
     api = MetaApi(TOKEN, {"region": METAAPI_REGION})
 
     try:
-        # ✅ get_account() avec un seul argument
         account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-        log(f"Compte MetaApi : {account.name} ({account.state}) | Région: {METAAPI_REGION}")
+        log(f"Compte : {account.name} ({account.state}) | Région: {METAAPI_REGION}")
 
         if account.state != "DEPLOYED":
-            log("Déploiement du compte...")
+            log("Déploiement...")
             await account.deploy()
 
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized(60)
-        log("🟢 BOT CONNECTÉ — Tourne 24/7")
+        log("🟢 BOT CONNECTÉ — Stratégie Ordres LIMIT")
 
         await trading_loop(account, connection)
 
