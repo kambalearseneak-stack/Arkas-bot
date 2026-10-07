@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — PRO 4.0 (get_recent_candles)
+# ARKAS STOCHASTIC MTF BOT — PRO 4.1 (get_historical_candles fix)
 # ==============================================================================
 
 # ==============================================================================
@@ -97,7 +97,7 @@ RISK_REWARD_RATIO = 2.0
 # ==============================================================================
 
 SCAN_INTERVAL = 15
-CANDLES_LIMIT = 300
+CANDLES_LIMIT = 100   # ✅ Réduit pour forcer données fraîches
 
 # ==============================================================================
 # 7. SPREAD
@@ -145,7 +145,7 @@ def normalize_volume(volume, minimum, maximum, step):
     return round(steps * step, 4)
 
 # ==============================================================================
-# 10. STOCHASTIQUE ALIGNÉ
+# 10. STOCHASTIQUE
 # ==============================================================================
 
 def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
@@ -309,40 +309,20 @@ def detect_bearish_reversal(candles_m15, stoch):
     return False
 
 # ==============================================================================
-# 14. BOUGIES — get_recent_candles (temps réel)
+# 14. BOUGIES — get_historical_candles SIMPLE
 # ==============================================================================
 
-async def get_candles(connection, symbol, timeframe, limit=CANDLES_LIMIT):
-    """
-    Récupère les bougies en temps réel via get_recent_candles.
-    Fallback sur get_historical_candles si échec.
-    """
+async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
+    """Récupère les bougies via get_historical_candles."""
     try:
-        # ✅ Priorité : get_recent_candles (données temps réel)
-        candles = None
-        try:
-            candles = await connection.get_recent_candles(
-                symbol=symbol,
-                timeframe=timeframe,
-                limit=limit
-            )
-        except Exception as e:
-            log(f"⚠️ [{symbol}] get_recent_candles échoué : {e} — fallback historique")
-
-        # Fallback si vide
-        if not candles or len(candles) < 3:
-            # Utilisation de account via connection.account
-            account = connection.account if hasattr(connection, "account") else None
-            if account is None:
-                # On tente avec le metaapi_account
-                pass
-            # Le fallback est géré au niveau de l'appel (voir analyze)
-
+        candles = await account.get_historical_candles(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit
+        )
         if not candles or len(candles) < 3:
             return None
-
         return candles
-
     except Exception as e:
         log(f"❌ [{symbol}] Erreur bougies {timeframe} : {e}")
         return None
@@ -427,15 +407,7 @@ async def manage_open_positions(account, connection, symbol):
             reset_position_state(symbol)
             return
 
-        candles_m15 = await get_candles(connection, symbol, TIMEFRAME_ENTRY)
-        if not candles_m15:
-            # Fallback historique
-            candles_m15 = await account.get_historical_candles(
-                symbol=symbol, timeframe=TIMEFRAME_ENTRY, limit=CANDLES_LIMIT
-            )
-            if candles_m15:
-                candles_m15 = candles_m15[:-1] if len(candles_m15) > 2 else candles_m15
-
+        candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15:
             return
@@ -546,31 +518,19 @@ async def analyze_and_trade(account, connection, symbol):
             await manage_open_positions(account, connection, symbol)
             return
 
-        # ✅ Récupération temps réel
-        candles_m15 = await get_candles(connection, symbol, TIMEFRAME_ENTRY)
-
-        # Fallback historique si recent échoue
-        if not candles_m15:
-            log(f"⚠️ [{symbol}] Fallback sur get_historical_candles")
-            candles_m15 = await account.get_historical_candles(
-                symbol=symbol, timeframe=TIMEFRAME_ENTRY, limit=CANDLES_LIMIT
-            )
-            if candles_m15:
-                candles_m15 = candles_m15[:-1] if len(candles_m15) > 2 else candles_m15
-
+        candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
             return
 
-        # ============ DEBUG ============
+        # DEBUG : afficher la dernière bougie
         if candles_m15 and len(candles_m15) >= 3:
             last = candles_m15[-1]
             last_time = last.get("time") or last.get("brokerTime") or "?"
             if DEBUG_LAST_LOG.get(symbol) != last_time:
                 DEBUG_LAST_LOG[symbol] = last_time
-                log(f"🔬 [{symbol}] Bougie M15 : {last_time} | O={last['open']} H={last['high']} L={last['low']} C={last['close']}")
+                log(f"🔬 [{symbol}] Dernière bougie M15 : {last_time} | C={last['close']}")
                 log(f"🔬 [{symbol}] Stoch K={round(stoch_m15['k'][-1], 2)} D={round(stoch_m15['d'][-1], 2)}")
-        # ================================
 
         prev_k, prev_d = stoch_m15["k"][-2], stoch_m15["d"][-2]
         curr_k, curr_d = stoch_m15["k"][-1], stoch_m15["d"][-1]
@@ -708,12 +668,12 @@ async def health_check_server():
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 4.0", flush=True)
+    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 4.1", flush=True)
     print("=" * 60, flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
     print(f"Timeframe : {TIMEFRAME_ENTRY}", flush=True)
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
-    print(f"Méthode bougies : get_recent_candles (temps réel)", flush=True)
+    print(f"Candles limit : {CANDLES_LIMIT}", flush=True)
     print(f"Région MetaApi : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
@@ -735,7 +695,7 @@ async def main():
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized(60)
-        log("🟢 BOT PRO 4.0 CONNECTÉ")
+        log("🟢 BOT PRO 4.1 CONNECTÉ")
 
         await trading_loop(account, connection)
 
