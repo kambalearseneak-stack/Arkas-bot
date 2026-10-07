@@ -7,8 +7,7 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — PRO 3.0
-# BE rapide + Trailing serré + Zone neutre + Anti-Répétition
+# ARKAS STOCHASTIC MTF BOT — PRO 3.1 (avec DEBUG Stoch)
 # ==============================================================================
 
 # ==============================================================================
@@ -48,7 +47,6 @@ LEVEL_SELL = 90
 ALERT_OVERBOUGHT = 85
 ALERT_OVERSOLD = 15
 
-# Filtre zone neutre
 ZONE_NEUTRAL_LOW = 45
 ZONE_NEUTRAL_HIGH = 55
 
@@ -83,22 +81,15 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 5. GESTION POSITION — SÉCURISATION RAPIDE + TRAILING SERRÉ
+# 5. GESTION POSITION
 # ==============================================================================
 
 ATR_PERIOD = 14
-
-# ✅ SL initial plus large (évite le bruit)
 ATR_SL_MULTIPLIER = 3.0
-
-# ✅ Trailing 2× plus serré (protège les gains rapidement)
 ATR_TRAIL_MULTIPLIER = 1.0
 ATR_MIN_TRAIL_STEP = 0.3
 
-# ✅ BE activé dès +0.5R (sécurité plus précoce)
 BREAK_EVEN_TRIGGER_R = 0.5
-
-# TP conservé à 2R
 RISK_REWARD_RATIO = 2.0
 
 # ==============================================================================
@@ -126,6 +117,7 @@ MAX_SPREAD = {
 
 LAST_SIGNAL = {}
 POSITION_STATE = {}
+DEBUG_LAST_LOG = {}  # Anti-spam des logs de debug
 
 def reset_position_state(symbol):
     POSITION_STATE[symbol] = {"r_reached": False, "alerted": False, "initial_risk": 0.0}
@@ -398,7 +390,7 @@ def can_modify_sl(spec, current_price, new_sl, digits):
     return abs(current_price - new_sl) >= min_distance
 
 # ==============================================================================
-# 18. GESTION POSITIONS — BE RAPIDE + TRAILING SERRÉ
+# 18. GESTION POSITIONS
 # ==============================================================================
 
 async def manage_open_positions(account, connection, symbol):
@@ -450,7 +442,6 @@ async def manage_open_positions(account, connection, symbol):
                     log(f"⚠️ [{symbol}] ALERTE Stoch M15 haute ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
-                # ✅ BE rapide : +0.5R suffit
                 profit = bid - open_price
                 if profit >= initial_risk * BREAK_EVEN_TRIGGER_R and current_sl < open_price:
                     be_sl = normalize_price(open_price + min_distance, digits) if min_distance > 0 else open_price
@@ -459,7 +450,6 @@ async def manage_open_positions(account, connection, symbol):
                     current_sl = be_sl
                     state["r_reached"] = True
 
-                # ✅ Trailing serré : ATR × 1.0
                 if state["r_reached"] and atr_m15 and atr_m15 > 0:
                     new_sl = normalize_price(bid - atr_m15 * ATR_TRAIL_MULTIPLIER, digits)
                     step_min = atr_m15 * ATR_MIN_TRAIL_STEP
@@ -479,7 +469,6 @@ async def manage_open_positions(account, connection, symbol):
                     log(f"⚠️ [{symbol}] ALERTE Stoch M15 basse ({curr_k:.1f}/{curr_d:.1f})")
                     state["alerted"] = True
 
-                # ✅ BE rapide : +0.5R suffit
                 profit = open_price - ask
                 if profit >= initial_risk * BREAK_EVEN_TRIGGER_R and (current_sl > open_price or current_sl == 0):
                     be_sl = normalize_price(open_price - min_distance, digits) if min_distance > 0 else open_price
@@ -488,7 +477,6 @@ async def manage_open_positions(account, connection, symbol):
                     current_sl = be_sl
                     state["r_reached"] = True
 
-                # ✅ Trailing serré : ATR × 1.0
                 if state["r_reached"] and atr_m15 and atr_m15 > 0:
                     new_sl = normalize_price(ask + atr_m15 * ATR_TRAIL_MULTIPLIER, digits)
                     step_min = atr_m15 * ATR_MIN_TRAIL_STEP
@@ -507,7 +495,7 @@ async def manage_open_positions(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur gestion positions : {e}")
 
 # ==============================================================================
-# 19. ANALYSE MTF
+# 19. ANALYSE MTF — avec DEBUG
 # ==============================================================================
 
 async def analyze_and_trade(account, connection, symbol):
@@ -530,6 +518,21 @@ async def analyze_and_trade(account, connection, symbol):
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
             return
 
+        # ============ DEBUG : afficher les dernières bougies + Stoch ============
+        if candles_m15 and len(candles_m15) >= 5:
+            last = candles_m15[-1]
+            prev = candles_m15[-2]
+            last_time = last.get("time") or last.get("brokerTime") or "?"
+            prev_time = prev.get("time") or prev.get("brokerTime") or "?"
+
+            # Anti-spam : ne log qu'une fois par bougie
+            if DEBUG_LAST_LOG.get(symbol) != last_time:
+                DEBUG_LAST_LOG[symbol] = last_time
+                log(f"🔬 [{symbol}] Bougie M15 en cours : {last_time} | O={last['open']} H={last['high']} L={last['low']} C={last['close']}")
+                log(f"🔬 [{symbol}] Bougie M15 précédente : {prev_time} | O={prev['open']} H={prev['high']} L={prev['low']} C={prev['close']}")
+                log(f"🔬 [{symbol}] Stoch K[-3:]={[round(x, 2) for x in stoch_m15['k'][-3:]]} D[-3:]={[round(x, 2) for x in stoch_m15['d'][-3:]]}")
+        # =====================================================================
+
         prev_k, prev_d = stoch_m15["k"][-2], stoch_m15["d"][-2]
         curr_k, curr_d = stoch_m15["k"][-1], stoch_m15["d"][-1]
         older_k = stoch_m15["k"][-3]
@@ -541,7 +544,6 @@ async def analyze_and_trade(account, connection, symbol):
             log(f"🔍 [{symbol}] M15 : K={curr_k:.1f} D={curr_d:.1f}")
             return
 
-        # Filtre zone neutre
         if cross_up and curr_k >= ZONE_NEUTRAL_LOW:
             log(f"🚫 [{symbol}] Croisement haussier ignoré — K={curr_k:.1f} ≥ {ZONE_NEUTRAL_LOW}")
             return
@@ -577,7 +579,6 @@ async def analyze_and_trade(account, connection, symbol):
 
         volume = get_fixed_lot(symbol, spec)
 
-        # SL = ATR × 3 (plus large), TP = 2R
         sl_distance = atr_m15 * ATR_SL_MULTIPLIER
         tp_distance = sl_distance * RISK_REWARD_RATIO
 
@@ -668,17 +669,12 @@ async def health_check_server():
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 3.0", flush=True)
+    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 3.1 (DEBUG)", flush=True)
     print("=" * 60, flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
     print(f"Timeframe : {TIMEFRAME_ENTRY}", flush=True)
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
-    print(f"Type d'ordre : MARKET", flush=True)
-    print(f"SL initial : ATR × {ATR_SL_MULTIPLIER}", flush=True)
-    print(f"BE : dès +{BREAK_EVEN_TRIGGER_R}R", flush=True)
-    print(f"Trailing : ATR × {ATR_TRAIL_MULTIPLIER} (pas min {ATR_MIN_TRAIL_STEP}× ATR)", flush=True)
-    print(f"TP initial : {RISK_REWARD_RATIO}R", flush=True)
-    print(f"Filtre zone neutre : {ZONE_NEUTRAL_LOW}-{ZONE_NEUTRAL_HIGH}", flush=True)
+    print(f"SL : ATR × {ATR_SL_MULTIPLIER} | BE : +{BREAK_EVEN_TRIGGER_R}R | Trailing : ATR × {ATR_TRAIL_MULTIPLIER}", flush=True)
     print(f"Région MetaApi : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
@@ -700,7 +696,7 @@ async def main():
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized(60)
-        log("🟢 BOT PRO 3.0 CONNECTÉ")
+        log("🟢 BOT PRO 3.1 CONNECTÉ — DEBUG activé")
 
         await trading_loop(account, connection)
 
