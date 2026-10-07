@@ -7,9 +7,8 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks FluxCharts)
-# Ordres LIMIT | SL = bord zone | TP = 2R | BE +1R | Trailing 1.5R
-# Bougie OB choisie selon méthode FluxCharts (POC + extrême)
+# ARKAS BOT — PA Multi-Critères (Step Index) + OB 5★ Fibo (XAUUSD)
+# Score ≥ 3 → Entrée LIMIT au prix du critère le plus fort
 # ==============================================================================
 
 # ==============================================================================
@@ -24,34 +23,36 @@ METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 # 2. MARCHÉS
 # ==============================================================================
 
-STOCH_SYMBOLS = ["Step Index"]
+PA_SYMBOLS = ["Step Index"]
 OB_SYMBOLS = ["XAUUSD"]
 
-TIMEFRAME_ANALYSIS = "1h"
 TIMEFRAME_ENTRY = "15m"
 
 # ==============================================================================
-# 3. STOCHASTIQUE (Step Index)
+# 3. PRICE ACTION MULTI-CRITÈRES (Step Index)
 # ==============================================================================
 
-STOCH_K = 5
-STOCH_D = 3
-STOCH_SLOWING = 3
+PA_EMA_PERIOD = 50
+PA_STRUCTURE_LOOKBACK = 30
+PA_SWING_PIVOT_LEN = 3
 
-H1_BUY_ZONE = 20
-H1_SELL_ZONE = 80
+PA_TRENDLINE_ENABLED = True
+PA_TRENDLINE_MIN_SLOPE = 0.00001
 
-ALERT_OVERBOUGHT = 85
-ALERT_OVERSOLD = 15
+PA_BREAKOUT_BODY_RATIO = 0.6
+PA_BREAKOUT_MIN_MARGIN = 0.3
+PA_FIBO_TOLERANCE = 0.25
 
-ATR_PERIOD_STOCH = 14
-ATR_SL_MULTIPLIER_STOCH = 3.0
-ATR_TRAIL_MULTIPLIER_STOCH = 1.0
-ATR_MIN_TRAIL_STEP_STOCH = 0.3
-BREAK_EVEN_TRIGGER_R_STOCH = 1.0
-RISK_REWARD_RATIO_STOCH = 2.0
+PA_ATR_PERIOD = 14
+PA_ATR_SL_MULTIPLIER = 2.0
+PA_ATR_TRAIL_MULTIPLIER = 1.0
+PA_BE_TRIGGER_R = 1.0
+PA_RR_RATIO = 2.0
 
-LOT_PER_STOCH_SYMBOL = {
+# ✅ Score minimum
+PA_MIN_SCORE = 3
+
+LOT_PER_PA_SYMBOL = {
     "Step Index": 0.1,
 }
 
@@ -65,7 +66,7 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 4. ORDER BLOCKS
+# 4. ORDER BLOCKS (XAUUSD)
 # ==============================================================================
 
 SWING_LEN = 5
@@ -80,8 +81,22 @@ OVERLAP_FILTER_ENABLED = True
 INVALIDATION_METHOD = "Wick"
 RR_RATIO_OB = 2.0
 MAX_LIMIT_ORDERS_PER_SYMBOL = 2
-MIN_QUALITY_SCORE = 4
 
+OB_MAX_SIZE_ATR_MULT = 1.0
+OB_MIN_VOLUME_RATIO = 1.3
+OB_MAX_BOS_AGE = 20
+OB_MAX_PENETRATION_PCT = 0.5
+OB_EMA_PERIOD = 50
+
+OB_MIN_SCORE = 3
+
+FIBO_LEVEL_BY_SCORE = {
+    5: 0.786,
+    4: 0.618,
+    3: 0.5,
+}
+
+SL_BUFFER_FACTOR = 0.5
 RISK_PERCENT_OB = 0.5
 
 VOLUME_LIMITS_OB = {
@@ -93,21 +108,8 @@ TRAILING_ENABLED_OB = True
 TRAILING_START_R_OB = 1.5
 TRAILING_DISTANCE_R_OB = 0.7
 
-# ==============================================================================
-# 4bis. INVALIDATION + SL TECHNIQUE OB PURE
-# ==============================================================================
-
-MIN_LIQUIDITY_SCORE = 0
 MAX_ORDER_AGE_HOURS = 4
 MAX_DISTANCE_FACTOR = 3.0
-SWEEP_DETECTION_ENABLED = True
-
-SL_LIQUIDITY_BUFFER_FACTOR = {"XAUUSD": 0.0}
-SL_MIN_BUFFER_POINTS = {"XAUUSD": 0.0}
-
-SL_USE_STRUCTURE = False
-SL_STRUCTURE_LOOKBACK = 20
-SL_STRUCTURE_MARGIN_POINTS = {}
 
 # ==============================================================================
 # 5. EXECUTION
@@ -155,37 +157,7 @@ def normalize_volume(volume, minimum, maximum, step):
     return round(steps * step, 4)
 
 # ==============================================================================
-# 8. STOCHASTIQUE
-# ==============================================================================
-
-def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
-    if not candles or len(candles) < (k_period + slowing + d_period):
-        return None
-    highs = [float(c["high"]) for c in candles]
-    lows = [float(c["low"]) for c in candles]
-    closes = [float(c["close"]) for c in candles]
-
-    fast_k = []
-    for i in range(k_period - 1, len(candles)):
-        h = max(highs[i - k_period + 1:i + 1])
-        l = min(lows[i - k_period + 1:i + 1])
-        fast_k.append(50.0 if h == l else ((closes[i] - l) / (h - l)) * 100)
-
-    slow_k = []
-    for i in range(slowing - 1, len(fast_k)):
-        slow_k.append(sum(fast_k[i - slowing + 1:i + 1]) / slowing)
-
-    d_line = []
-    for i in range(d_period - 1, len(slow_k)):
-        d_line.append(sum(slow_k[i - d_period + 1:i + 1]) / d_period)
-
-    aligned_k = slow_k[d_period - 1:]
-    if len(aligned_k) != len(d_line) or not aligned_k:
-        return None
-    return {"k": aligned_k, "d": d_line}
-
-# ==============================================================================
-# 9. ATR
+# 8. ATR
 # ==============================================================================
 
 def calculate_atr(candles, period=14):
@@ -202,85 +174,21 @@ def calculate_atr(candles, period=14):
     return sum(trs[-period:]) / period
 
 # ==============================================================================
-# 10. STRUCTURE
+# 9. EMA
 # ==============================================================================
 
-def detect_structure(candles, lookback=5):
-    if not candles or len(candles) < lookback * 2 + 1:
-        return None, None
-    recent = candles[-lookback * 2:]
-    lows = [float(c["low"]) for c in recent]
-    highs = [float(c["high"]) for c in recent]
-    last_swing_low = None
-    for i in range(1, len(lows) - 1):
-        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
-            last_swing_low = lows[i]
-    last_swing_high = None
-    for i in range(1, len(highs) - 1):
-        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
-            last_swing_high = highs[i]
-    return last_swing_low, last_swing_high
-
-def structure_confirms_buy(candles, current_price, lookback=5):
-    if len(candles) < 3:
-        return False
-    last, prev = candles[-1], candles[-2]
-    body_last = abs(float(last["close"]) - float(last["open"]))
-    lw_last = min(float(last["close"]), float(last["open"])) - float(last["low"])
-    body_prev = abs(float(prev["close"]) - float(prev["open"]))
-    lw_prev = min(float(prev["close"]), float(prev["open"])) - float(prev["low"])
-    wick_rejection = (body_last > 0 and lw_last >= body_last) or (body_prev > 0 and lw_prev >= body_prev)
-    swing_low, _ = detect_structure(candles[:-1], lookback)
-    above = (swing_low is None) or (current_price > swing_low)
-    return wick_rejection and above
-
-def structure_confirms_sell(candles, current_price, lookback=5):
-    if len(candles) < 3:
-        return False
-    last, prev = candles[-1], candles[-2]
-    body_last = abs(float(last["close"]) - float(last["open"]))
-    uw_last = float(last["high"]) - max(float(last["close"]), float(last["open"]))
-    body_prev = abs(float(prev["close"]) - float(prev["open"]))
-    uw_prev = float(prev["high"]) - max(float(prev["close"]), float(prev["open"]))
-    wick_rejection = (body_last > 0 and uw_last >= body_last) or (body_prev > 0 and uw_prev >= body_prev)
-    _, swing_high = detect_structure(candles[:-1], lookback)
-    below = (swing_high is None) or (current_price < swing_high)
-    return wick_rejection and below
+def calculate_ema(candles, period):
+    if not candles or len(candles) < period:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    ema = sum(closes[:period]) / period
+    k = 2 / (period + 1)
+    for i in range(period, len(closes)):
+        ema = closes[i] * k + ema * (1 - k)
+    return ema
 
 # ==============================================================================
-# 11. RETOURNEMENTS
-# ==============================================================================
-
-def detect_bullish_reversal(candles_m15, stoch):
-    if not stoch or len(stoch["k"]) < 3:
-        return False
-    prev_k, prev_d = stoch["k"][-2], stoch["d"][-2]
-    curr_k, curr_d = stoch["k"][-1], stoch["d"][-1]
-    cross_down = prev_k >= prev_d and curr_k < curr_d
-    in_high_zone = curr_k >= 60 or prev_k >= 70
-    if cross_down and in_high_zone:
-        return True
-    swing_low, _ = detect_structure(candles_m15[:-1], 5)
-    if swing_low is not None and float(candles_m15[-1]["close"]) < swing_low:
-        return True
-    return False
-
-def detect_bearish_reversal(candles_m15, stoch):
-    if not stoch or len(stoch["k"]) < 3:
-        return False
-    prev_k, prev_d = stoch["k"][-2], stoch["d"][-2]
-    curr_k, curr_d = stoch["k"][-1], stoch["d"][-1]
-    cross_up = prev_k <= prev_d and curr_k > curr_d
-    in_low_zone = curr_k <= 40 or prev_k <= 30
-    if cross_up and in_low_zone:
-        return True
-    _, swing_high = detect_structure(candles_m15[:-1], 5)
-    if swing_high is not None and float(candles_m15[-1]["close"]) > swing_high:
-        return True
-    return False
-
-# ==============================================================================
-# 12. BOUGIES
+# 10. BOUGIES
 # ==============================================================================
 
 async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
@@ -296,7 +204,7 @@ async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
         return None
 
 # ==============================================================================
-# 13. VÉRIF SYMBOLE
+# 11. VÉRIF SYMBOLE
 # ==============================================================================
 
 async def is_symbol_tradable(connection, symbol):
@@ -312,20 +220,7 @@ async def is_symbol_tradable(connection, symbol):
         return False, None
 
 # ==============================================================================
-# 14. VOLUME STOCH
-# ==============================================================================
-
-def get_fixed_lot_stoch(symbol, spec):
-    min_vol = float(spec.get("minVolume", 0.01))
-    max_vol = float(spec.get("maxVolume", 100))
-    step = float(spec.get("volumeStep", 0.01))
-    target = LOT_PER_STOCH_SYMBOL.get(symbol, min_vol)
-    volume = normalize_volume(target, min_vol, max_vol, step)
-    log(f"💰 [{symbol}] Lot = {volume}")
-    return volume
-
-# ==============================================================================
-# 15. STOPS
+# 12. STOPS
 # ==============================================================================
 
 def get_min_stop_distance(spec, digits):
@@ -357,214 +252,500 @@ def can_modify_sl(spec, current, new_sl, digits):
     return abs(current - new_sl) >= md
 
 # ==============================================================================
-# 16. GESTION POSITIONS STOCH
+# 13. PRICE ACTION — Swings
 # ==============================================================================
 
-async def manage_open_positions_stoch(account, connection, symbol):
+def find_pa_swings(candles, lookback=PA_STRUCTURE_LOOKBACK, pivot_len=PA_SWING_PIVOT_LEN):
+    if not candles or len(candles) < lookback:
+        return [], []
+    recent = candles[-lookback:]
+    highs = []
+    lows = []
+    for i in range(pivot_len, len(recent) - pivot_len):
+        is_sh = True
+        for j in range(1, pivot_len + 1):
+            if float(recent[i]["high"]) <= float(recent[i - j]["high"]) or float(recent[i]["high"]) <= float(recent[i + j]["high"]):
+                is_sh = False
+                break
+        if is_sh:
+            highs.append({
+                "index": len(candles) - lookback + i,
+                "price": float(recent[i]["high"]),
+            })
+        is_sl = True
+        for j in range(1, pivot_len + 1):
+            if float(recent[i]["low"]) >= float(recent[i - j]["low"]) or float(recent[i]["low"]) >= float(recent[i + j]["low"]):
+                is_sl = False
+                break
+        if is_sl:
+            lows.append({
+                "index": len(candles) - lookback + i,
+                "price": float(recent[i]["low"]),
+            })
+    return highs, lows
+
+# ==============================================================================
+# 14. PRICE ACTION — Trendlines
+# ==============================================================================
+
+def build_trendline_bull_pa(candles, swings_lows):
+    if len(swings_lows) < 2:
+        return None
+    p1 = swings_lows[-2]
+    p2 = swings_lows[-1]
+    if p2["index"] <= p1["index"]:
+        return None
+    slope = (p2["price"] - p1["price"]) / (p2["index"] - p1["index"])
+    if slope <= PA_TRENDLINE_MIN_SLOPE:
+        return None
+    current_idx = len(candles) - 1
+    price_at_current = p2["price"] + slope * (current_idx - p2["index"])
+    return price_at_current, slope
+
+def build_trendline_bear_pa(candles, swings_highs):
+    if len(swings_highs) < 2:
+        return None
+    p1 = swings_highs[-2]
+    p2 = swings_highs[-1]
+    if p2["index"] <= p1["index"]:
+        return None
+    slope = (p2["price"] - p1["price"]) / (p2["index"] - p1["index"])
+    if slope >= -PA_TRENDLINE_MIN_SLOPE:
+        return None
+    current_idx = len(candles) - 1
+    price_at_current = p2["price"] + slope * (current_idx - p2["index"])
+    return price_at_current, slope
+
+# ==============================================================================
+# 15. ✅ PA — Détection de TOUS les critères indépendants
+# ==============================================================================
+
+def detect_all_pa_entries(candles):
+    """
+    Détecte TOUS les critères PA avec leur propre entry/score.
+    Retourne une liste de dicts {critere, direction, entry, sl, score, raison}
+    """
+    entries = []
+    
+    if not candles or len(candles) < PA_EMA_PERIOD + 10:
+        return entries
+    
+    atr = calculate_atr(candles, PA_ATR_PERIOD)
+    if not atr or atr <= 0:
+        return entries
+    
+    current_close = float(candles[-1]["close"])
+    current_high = float(candles[-1]["high"])
+    current_low = float(candles[-1]["low"])
+    current_open = float(candles[-1]["open"])
+    
+    ema = calculate_ema(candles, PA_EMA_PERIOD)
+    swings_highs, swings_lows = find_pa_swings(candles)
+    
+    tolerance = atr * PA_FIBO_TOLERANCE
+    
+    # =========================================================================
+    # CRITÈRE 1 : RETEST DU NIVEAU CASSÉ (+3)
+    # =========================================================================
+    if swings_highs:
+        last_sh = swings_highs[-1]
+        bars_since = len(candles) - 1 - last_sh["index"]
+        if 0 <= bars_since <= 15:
+            if current_low <= last_sh["price"] + tolerance and current_close > last_sh["price"]:
+                entries.append({
+                    "critere": "Retest niveau cassé",
+                    "direction": "BUY",
+                    "entry": last_sh["price"],
+                    "sl": last_sh["price"] - atr * PA_ATR_SL_MULTIPLIER,
+                    "score": 3,
+                    "raison": f"Retest du swing high {last_sh['price']:.2f}"
+                })
+    
+    if swings_lows:
+        last_sl = swings_lows[-1]
+        bars_since = len(candles) - 1 - last_sl["index"]
+        if 0 <= bars_since <= 15:
+            if current_high >= last_sl["price"] - tolerance and current_close < last_sl["price"]:
+                entries.append({
+                    "critere": "Retest niveau cassé",
+                    "direction": "SELL",
+                    "entry": last_sl["price"],
+                    "sl": last_sl["price"] + atr * PA_ATR_SL_MULTIPLIER,
+                    "score": 3,
+                    "raison": f"Retest du swing low {last_sl['price']:.2f}"
+                })
+    
+    # =========================================================================
+    # CRITÈRE 2 : CASSURE DIRECTE (+3)
+    # =========================================================================
+    body = abs(current_close - current_open)
+    rng = current_high - current_low
+    
+    if rng > 0 and (body / rng) >= PA_BREAKOUT_BODY_RATIO:
+        margin_min = atr * PA_BREAKOUT_MIN_MARGIN
+        
+        if swings_highs:
+            last_sh = swings_highs[-1]
+            if current_close > last_sh["price"] + margin_min:
+                prev_close = float(candles[-2]["close"])
+                if prev_close <= last_sh["price"]:
+                    entries.append({
+                        "critere": "Cassure directe",
+                        "direction": "BUY",
+                        "entry": current_close,
+                        "sl": last_sh["price"] - atr * 0.5,
+                        "score": 3,
+                        "raison": f"Cassure nette de {last_sh['price']:.2f}"
+                    })
+        
+        if swings_lows:
+            last_sl = swings_lows[-1]
+            if current_close < last_sl["price"] - margin_min:
+                prev_close = float(candles[-2]["close"])
+                if prev_close >= last_sl["price"]:
+                    entries.append({
+                        "critere": "Cassure directe",
+                        "direction": "SELL",
+                        "entry": current_close,
+                        "sl": last_sl["price"] + atr * 0.5,
+                        "score": 3,
+                        "raison": f"Cassure nette de {last_sl['price']:.2f}"
+                    })
+    
+    # =========================================================================
+    # CRITÈRE 3 : FIBO 0.618 (+2)
+    # =========================================================================
+    if swings_highs and swings_lows:
+        last_sh = swings_highs[-1]
+        last_sl = swings_lows[-1]
+        
+        if last_sh["index"] > last_sl["index"]:
+            swing_range = last_sh["price"] - last_sl["price"]
+            if swing_range > 0:
+                fibo_618 = last_sh["price"] - swing_range * 0.618
+                if abs(current_close - fibo_618) <= tolerance:
+                    entries.append({
+                        "critere": "Fibo 0.618",
+                        "direction": "BUY",
+                        "entry": fibo_618,
+                        "sl": last_sh["price"] - swing_range * 0.786,
+                        "score": 2,
+                        "raison": f"Retracement 0.618 à {fibo_618:.2f}"
+                    })
+        else:
+            swing_range = last_sh["price"] - last_sl["price"]
+            if swing_range > 0:
+                fibo_618 = last_sl["price"] + swing_range * 0.618
+                if abs(current_close - fibo_618) <= tolerance:
+                    entries.append({
+                        "critere": "Fibo 0.618",
+                        "direction": "SELL",
+                        "entry": fibo_618,
+                        "sl": last_sl["price"] + swing_range * 0.786,
+                        "score": 2,
+                        "raison": f"Retracement 0.618 à {fibo_618:.2f}"
+                    })
+    
+    # =========================================================================
+    # CRITÈRE 4 : FIBO 0.786 (+2)
+    # =========================================================================
+    if swings_highs and swings_lows:
+        last_sh = swings_highs[-1]
+        last_sl = swings_lows[-1]
+        
+        if last_sh["index"] > last_sl["index"]:
+            swing_range = last_sh["price"] - last_sl["price"]
+            if swing_range > 0:
+                fibo_786 = last_sh["price"] - swing_range * 0.786
+                if abs(current_close - fibo_786) <= tolerance:
+                    entries.append({
+                        "critere": "Fibo 0.786",
+                        "direction": "BUY",
+                        "entry": fibo_786,
+                        "sl": last_sh["price"] - swing_range * 0.95,
+                        "score": 2,
+                        "raison": f"Retracement 0.786 à {fibo_786:.2f}"
+                    })
+        else:
+            swing_range = last_sh["price"] - last_sl["price"]
+            if swing_range > 0:
+                fibo_786 = last_sl["price"] + swing_range * 0.786
+                if abs(current_close - fibo_786) <= tolerance:
+                    entries.append({
+                        "critere": "Fibo 0.786",
+                        "direction": "SELL",
+                        "entry": fibo_786,
+                        "sl": last_sl["price"] + swing_range * 0.95,
+                        "score": 2,
+                        "raison": f"Retracement 0.786 à {fibo_786:.2f}"
+                    })
+    
+    # =========================================================================
+    # CRITÈRE 5 : RETEST TRENDLINE (+2)
+    # =========================================================================
+    if PA_TRENDLINE_ENABLED:
+        tl_bull = build_trendline_bull_pa(candles, swings_lows)
+        if tl_bull:
+            tl_price, slope = tl_bull
+            if abs(current_low - tl_price) <= tolerance and current_close > tl_price:
+                entries.append({
+                    "critere": "Retest trendline bull",
+                    "direction": "BUY",
+                    "entry": tl_price,
+                    "sl": tl_price - atr * PA_ATR_SL_MULTIPLIER,
+                    "score": 2,
+                    "raison": f"Retest trendline haussière à {tl_price:.2f}"
+                })
+        
+        tl_bear = build_trendline_bear_pa(candles, swings_highs)
+        if tl_bear:
+            tl_price, slope = tl_bear
+            if abs(current_high - tl_price) <= tolerance and current_close < tl_price:
+                entries.append({
+                    "critere": "Retest trendline bear",
+                    "direction": "SELL",
+                    "entry": tl_price,
+                    "sl": tl_price + atr * PA_ATR_SL_MULTIPLIER,
+                    "score": 2,
+                    "raison": f"Retest trendline baissière à {tl_price:.2f}"
+                })
+    
+    # =========================================================================
+    # CRITÈRE 6 : RETEST EMA 50 (+1)
+    # =========================================================================
+    if ema:
+        if abs(current_low - ema) <= tolerance and current_close > ema:
+            entries.append({
+                "critere": "Retest EMA 50",
+                "direction": "BUY",
+                "entry": ema,
+                "sl": ema - atr * PA_ATR_SL_MULTIPLIER,
+                "score": 1,
+                "raison": f"Retest EMA 50 à {ema:.2f}"
+            })
+        
+        if abs(current_high - ema) <= tolerance and current_close < ema:
+            entries.append({
+                "critere": "Retest EMA 50",
+                "direction": "SELL",
+                "entry": ema,
+                "sl": ema + atr * PA_ATR_SL_MULTIPLIER,
+                "score": 1,
+                "raison": f"Retest EMA 50 à {ema:.2f}"
+            })
+    
+    return entries
+
+# ==============================================================================
+# 16. PRICE ACTION — Gestion positions
+# ==============================================================================
+
+async def manage_positions_pa(account, connection, symbol):
     try:
         positions = await connection.get_positions()
         sym_pos = [p for p in positions if p.get("symbol") == symbol]
         if not sym_pos:
             reset_position_state(symbol)
             return
-
-        candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
-        stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
-        if not stoch_m15:
+        
+        candles = await get_candles(account, symbol, TIMEFRAME_ENTRY)
+        if not candles:
             return
-
-        curr_k = stoch_m15["k"][-1]
-        curr_d = stoch_m15["d"][-1]
-        atr_m15 = calculate_atr(candles_m15, ATR_PERIOD_STOCH)
-
+        
+        atr = calculate_atr(candles, PA_ATR_PERIOD)
         spec = await connection.get_symbol_specification(symbol)
         digits = int(spec.get("digits", 2))
         min_distance = get_min_stop_distance(spec, digits)
-
+        
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
-
+        
         state = ensure_position_state(symbol)
-
+        
         for pos in sym_pos:
             pos_id = pos["id"]
             pos_type = pos.get("type")
             open_price = float(pos["openPrice"])
             current_sl = float(pos.get("stopLoss", 0) or 0)
             current_tp = pos.get("takeProfit")
-
+            
             if state["initial_risk"] <= 0:
                 if current_sl and current_sl != 0:
                     state["initial_risk"] = abs(open_price - current_sl)
-                elif atr_m15:
-                    state["initial_risk"] = atr_m15 * ATR_SL_MULTIPLIER_STOCH
+                elif atr:
+                    state["initial_risk"] = atr * PA_ATR_SL_MULTIPLIER
                 else:
                     state["initial_risk"] = DEFAULT_SL_POINTS.get(symbol, 100.0)
             ir = state["initial_risk"]
-
+            
             if pos_type == "POSITION_TYPE_BUY":
-                if (curr_k >= ALERT_OVERBOUGHT or curr_d >= ALERT_OVERBOUGHT) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE Stoch haute ({curr_k:.1f}/{curr_d:.1f})")
-                    state["alerted"] = True
-
                 profit = bid - open_price
-                if profit >= ir * BREAK_EVEN_TRIGGER_R_STOCH and current_sl < open_price:
+                if profit >= ir * PA_BE_TRIGGER_R and current_sl < open_price:
                     be_sl = normalize_price(open_price + min_distance, digits) if min_distance > 0 else open_price
                     log(f"🛡️ [{symbol}] +1R → BE BUY #{pos_id} SL={be_sl}")
                     await connection.modify_position(pos_id, stop_loss=be_sl, take_profit=current_tp)
                     current_sl = be_sl
                     state["r_reached"] = True
-
-                if state["r_reached"] and atr_m15 and atr_m15 > 0:
-                    new_sl = normalize_price(bid - atr_m15 * ATR_TRAIL_MULTIPLIER_STOCH, digits)
-                    step_min = atr_m15 * ATR_MIN_TRAIL_STEP_STOCH
-                    if new_sl > current_sl + step_min and can_modify_sl(spec, bid, new_sl, digits):
+                
+                if state["r_reached"] and atr and atr > 0:
+                    new_sl = normalize_price(bid - atr * PA_ATR_TRAIL_MULTIPLIER, digits)
+                    if new_sl > current_sl and can_modify_sl(spec, bid, new_sl, digits):
                         log(f"📈 [{symbol}] Trailing BUY #{pos_id} SL={new_sl}")
                         await connection.modify_position(pos_id, stop_loss=new_sl, take_profit=current_tp)
                         current_sl = new_sl
-
-                if detect_bullish_reversal(candles_m15, stoch_m15):
-                    log(f"🔴 [{symbol}] Retournement → Fermeture BUY #{pos_id}")
-                    await connection.close_position(pos_id)
-                    reset_position_state(symbol)
-                    continue
-
+            
             elif pos_type == "POSITION_TYPE_SELL":
-                if (curr_k <= ALERT_OVERSOLD or curr_d <= ALERT_OVERSOLD) and not state["alerted"]:
-                    log(f"⚠️ [{symbol}] ALERTE Stoch basse ({curr_k:.1f}/{curr_d:.1f})")
-                    state["alerted"] = True
-
                 profit = open_price - ask
-                if profit >= ir * BREAK_EVEN_TRIGGER_R_STOCH and (current_sl > open_price or current_sl == 0):
+                if profit >= ir * PA_BE_TRIGGER_R and (current_sl > open_price or current_sl == 0):
                     be_sl = normalize_price(open_price - min_distance, digits) if min_distance > 0 else open_price
                     log(f"🛡️ [{symbol}] +1R → BE SELL #{pos_id} SL={be_sl}")
                     await connection.modify_position(pos_id, stop_loss=be_sl, take_profit=current_tp)
                     current_sl = be_sl
                     state["r_reached"] = True
-
-                if state["r_reached"] and atr_m15 and atr_m15 > 0:
-                    new_sl = normalize_price(ask + atr_m15 * ATR_TRAIL_MULTIPLIER_STOCH, digits)
-                    step_min = atr_m15 * ATR_MIN_TRAIL_STEP_STOCH
-                    if new_sl < current_sl - step_min and can_modify_sl(spec, ask, new_sl, digits):
+                
+                if state["r_reached"] and atr and atr > 0:
+                    new_sl = normalize_price(ask + atr * PA_ATR_TRAIL_MULTIPLIER, digits)
+                    if new_sl < current_sl and can_modify_sl(spec, ask, new_sl, digits):
                         log(f"📉 [{symbol}] Trailing SELL #{pos_id} SL={new_sl}")
                         await connection.modify_position(pos_id, stop_loss=new_sl, take_profit=current_tp)
                         current_sl = new_sl
-
-                if detect_bearish_reversal(candles_m15, stoch_m15):
-                    log(f"🟢 [{symbol}] Retournement → Fermeture SELL #{pos_id}")
-                    await connection.close_position(pos_id)
-                    reset_position_state(symbol)
-                    continue
     except Exception as e:
-        log(f"❌ [{symbol}] Erreur gestion Stoch : {e}")
+        log(f"❌ [{symbol}] Erreur gestion PA : {e}")
 
 # ==============================================================================
-# 17. ANALYSE STOCH
+# 17. PRICE ACTION — Analyse principale
 # ==============================================================================
 
-async def analyze_stoch(account, connection, symbol):
+async def analyze_pa(account, connection, symbol):
     try:
         tradable, spec = await is_symbol_tradable(connection, symbol)
         if not tradable or not spec:
             return
-
+        
         digits = int(spec.get("digits", 2))
-
+        
         positions = await connection.get_positions()
         active = [p for p in positions if p.get("symbol") == symbol]
         if len(active) >= 1:
-            await manage_open_positions_stoch(account, connection, symbol)
+            await manage_positions_pa(account, connection, symbol)
             return
-
-        candles_h1 = await get_candles(account, symbol, TIMEFRAME_ANALYSIS)
-        stoch_h1 = calculate_stochastic(candles_h1, STOCH_K, STOCH_D, STOCH_SLOWING)
-        if not stoch_h1:
+        
+        candles = await get_candles(account, symbol, TIMEFRAME_ENTRY)
+        if not candles or len(candles) < PA_EMA_PERIOD + 10:
             return
-
-        h1_k = stoch_h1["k"][-1]
-        h1_d = stoch_h1["d"][-1]
-        h1_buy_setup = h1_k <= H1_BUY_ZONE and h1_d <= H1_BUY_ZONE
-        h1_sell_setup = h1_k >= H1_SELL_ZONE and h1_d >= H1_SELL_ZONE
-
-        if not (h1_buy_setup or h1_sell_setup):
-            if h1_k <= 30 or h1_k >= 70:
-                log(f"🔍 [{symbol}] H1 proche : K={h1_k:.1f} D={h1_d:.1f}")
+        
+        atr = calculate_atr(candles, PA_ATR_PERIOD)
+        if not atr or atr <= 0:
             return
-
-        log(f"🎯 [{symbol}] H1 zone OK : K={h1_k:.1f} D={h1_d:.1f}")
-
-        candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
-        stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
-        if not stoch_m15 or len(stoch_m15["k"]) < 3:
+        
+        # ✅ Détection de TOUS les critères
+        entries = detect_all_pa_entries(candles)
+        
+        if not entries:
+            log(f"🔍 [{symbol}] PA : aucun critère détecté")
             return
-
-        prev_k, prev_d = stoch_m15["k"][-2], stoch_m15["d"][-2]
-        curr_k, curr_d = stoch_m15["k"][-1], stoch_m15["d"][-1]
-        older_k = stoch_m15["k"][-3]
-
-        buy_confirmed = h1_buy_setup and prev_k <= prev_d and curr_k > curr_d and curr_k > older_k
-        sell_confirmed = h1_sell_setup and prev_k >= prev_d and curr_k < curr_d and curr_k < older_k
-
-        if not (buy_confirmed or sell_confirmed):
-            log(f"🔍 [{symbol}] M15 attente : K={curr_k:.1f} D={curr_d:.1f}")
+        
+        # Log de tous les critères détectés
+        buy_entries = [e for e in entries if e["direction"] == "BUY"]
+        sell_entries = [e for e in entries if e["direction"] == "SELL"]
+        
+        score_buy = sum(e["score"] for e in buy_entries)
+        score_sell = sum(e["score"] for e in sell_entries)
+        
+        log(f"📊 [{symbol}] Critères PA détectés :")
+        for e in entries:
+            log(f"     • {e['critere']} ({e['direction']}) +{e['score']} pts — {e['raison']}")
+        log(f"     → BUY total = {score_buy} pts | SELL total = {score_sell} pts")
+        
+        # ✅ Décision : prendre la direction avec le meilleur score
+        if score_buy >= score_sell and score_buy >= PA_MIN_SCORE:
+            best_direction = "BUY"
+            best_entries = buy_entries
+            total_score = score_buy
+        elif score_sell > score_buy and score_sell >= PA_MIN_SCORE:
+            best_direction = "SELL"
+            best_entries = sell_entries
+            total_score = score_sell
+        else:
+            log(f"⏸️ [{symbol}] Score total {max(score_buy, score_sell)} < {PA_MIN_SCORE} → ignoré")
             return
-
-        signal_type = "BUY" if buy_confirmed else "SELL"
-        if LAST_SIGNAL.get(symbol) == signal_type:
-            log(f"⏸️ [{symbol}] Signal {signal_type} déjà traité")
+        
+        # Anti-répétition
+        if LAST_SIGNAL.get(symbol) == best_direction:
+            log(f"⏸️ [{symbol}] Signal {best_direction} déjà traité")
             return
-
+        
+        # ✅ Choisir le critère avec le score max
+        best_entries.sort(key=lambda e: -e["score"])
+        best_entry = best_entries[0]
+        
+        # Prix + spread
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
+        
         if (ask - bid) > MAX_SPREAD.get(symbol, 999.0):
             log(f"🚫 [{symbol}] Spread trop élevé")
             return
-
-        atr_m15 = calculate_atr(candles_m15, ATR_PERIOD_STOCH)
-        if not atr_m15 or atr_m15 <= 0:
-            return
-
-        if buy_confirmed and not structure_confirms_buy(candles_m15, ask):
-            return
-        if sell_confirmed and not structure_confirms_sell(candles_m15, bid):
-            return
-
-        volume = get_fixed_lot_stoch(symbol, spec)
-        sl_distance = atr_m15 * ATR_SL_MULTIPLIER_STOCH
-        tp_distance = sl_distance * RISK_REWARD_RATIO_STOCH
-
-        if buy_confirmed:
-            sl_price = normalize_price(ask - sl_distance, digits)
-            tp_price = normalize_price(ask + tp_distance, digits)
-            sl_price, tp_price = validate_stops(spec, ask, sl_price, tp_price, digits)
-
-            log(f"🚀 [{symbol}] ACHAT | Entry={ask} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+        
+        volume = normalize_volume(
+            LOT_PER_PA_SYMBOL.get(symbol, 0.01),
+            float(spec.get("minVolume", 0.01)),
+            float(spec.get("maxVolume", 100)),
+            float(spec.get("volumeStep", 0.01))
+        )
+        
+        # Entry / SL / TP du meilleur critère
+        entry_price = best_entry["entry"]
+        sl_base = best_entry["sl"]
+        sl_distance = abs(entry_price - sl_base)
+        
+        if sl_distance <= 0:
+            sl_distance = atr * PA_ATR_SL_MULTIPLIER
+        
+        tp_distance = sl_distance * PA_RR_RATIO
+        
+        # ✅ Ordre LIMIT
+        if best_direction == "BUY":
+            sl_price = normalize_price(entry_price - sl_distance, digits)
+            tp_price = normalize_price(entry_price + tp_distance, digits)
+            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
+            
+            log(f"📋 [{symbol}] PA BUY LIMIT (score {total_score}) | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+            log(f"     → Critère : {best_entry['critere']} — {best_entry['raison']}")
             try:
-                await connection.create_market_buy_order(symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price)
-                log(f"✅ [{symbol}] ACHAT exécuté")
+                await connection.create_limit_buy_order(
+                    symbol=symbol, volume=volume, open_price=entry_price,
+                    stop_loss=sl_price, take_profit=tp_price
+                )
+                log(f"✅ [{symbol}] BUY LIMIT placé")
                 LAST_SIGNAL[symbol] = "BUY"
                 reset_position_state(symbol)
             except Exception as e:
-                log(f"❌ [{symbol}] ACHAT erreur : {e}")
-
-        elif sell_confirmed:
-            sl_price = normalize_price(bid + sl_distance, digits)
-            tp_price = normalize_price(bid - tp_distance, digits)
-            sl_price, tp_price = validate_stops(spec, bid, sl_price, tp_price, digits)
-
-            log(f"🔻 [{symbol}] VENTE | Entry={bid} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+                log(f"❌ [{symbol}] BUY LIMIT erreur : {e}")
+        
+        elif best_direction == "SELL":
+            sl_price = normalize_price(entry_price + sl_distance, digits)
+            tp_price = normalize_price(entry_price - tp_distance, digits)
+            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
+            
+            log(f"📋 [{symbol}] PA SELL LIMIT (score {total_score}) | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+            log(f"     → Critère : {best_entry['critere']} — {best_entry['raison']}")
             try:
-                await connection.create_market_sell_order(symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price)
-                log(f"✅ [{symbol}] VENTE exécutée")
+                await connection.create_limit_sell_order(
+                    symbol=symbol, volume=volume, open_price=entry_price,
+                    stop_loss=sl_price, take_profit=tp_price
+                )
+                log(f"✅ [{symbol}] SELL LIMIT placé")
                 LAST_SIGNAL[symbol] = "SELL"
                 reset_position_state(symbol)
             except Exception as e:
-                log(f"❌ [{symbol}] VENTE erreur : {e}")
+                log(f"❌ [{symbol}] SELL LIMIT erreur : {e}")
+    
     except Exception as e:
-        log(f"❌ [{symbol}] Erreur analyse Stoch : {e}")
+        log(f"❌ [{symbol}] Erreur analyse PA : {e}")
 
 # ==============================================================================
-# 18. ORDER BLOCK — SWINGS + BOS
+# 18. ORDER BLOCK — Swings + BOS
 # ==============================================================================
 
 def find_swing_highs_lows(candles, swing_len):
@@ -597,7 +778,7 @@ def detect_bos(candles, swing_highs, swing_lows):
     return bos_list
 
 # ==============================================================================
-# 19. POC — Point of Control
+# 19. POC
 # ==============================================================================
 
 def find_poc(candles, from_idx, to_idx, n_bins=POC_BINS):
@@ -643,30 +824,16 @@ def count_touches_poc(candles, from_idx, to_idx, poc):
             count += 1
     return count
 
-# ==============================================================================
-# 20. ✅ FONCTION CORRIGÉE — Choix de la bougie OB (FluxCharts)
-# ==============================================================================
-
 def find_best_poc_candle(candles, from_idx, to_idx, poc, is_bull):
-    """
-    Trouve LA bougie OB conforme FluxCharts :
-      - Elle touche le POC
-      - Pour BULL : low le plus bas parmi les bougies qui touchent le POC
-      - Pour BEAR : high le plus haut parmi les bougies qui touchent le POC
-    """
     if poc is None or from_idx >= to_idx:
         return None
-
     best_idx = None
     best_extreme = None
-
     for i in range(to_idx, from_idx - 1, -1):
         lo = float(candles[i]["low"])
         hi = float(candles[i]["high"])
-        touches = lo <= poc <= hi
-        if not touches:
+        if not (lo <= poc <= hi):
             continue
-
         if is_bull:
             if best_extreme is None or lo < best_extreme:
                 best_extreme = lo
@@ -675,11 +842,10 @@ def find_best_poc_candle(candles, from_idx, to_idx, poc, is_bull):
             if best_extreme is None or hi > best_extreme:
                 best_extreme = hi
                 best_idx = i
-
     return best_idx
 
 # ==============================================================================
-# 21. GAP + OVERLAP
+# 20. GAP + OVERLAP
 # ==============================================================================
 
 def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
@@ -713,28 +879,54 @@ def ob_overlaps_active(zones, top, bottom):
     return False
 
 # ==============================================================================
-# 22. SWEEP (invalidation)
+# 21. SCORE OB 5★
 # ==============================================================================
 
-def detect_liquidity_sweep(candles, zone):
-    if len(candles) < 2:
-        return False
-    last = candles[-1]
-    lh = float(last["high"])
-    ll = float(last["low"])
-    lc = float(last["close"])
-    if zone["type"] == "BULL":
-        if ll < zone["bottom"] and lc > zone["bottom"]:
-            log(f"🌊 Sweep BULL détecté")
-            return True
-    else:
-        if lh > zone["top"] and lc < zone["top"]:
-            log(f"🌊 Sweep BEAR détecté")
-            return True
-    return False
+def calculate_ob_score(candles, bos, anchor_idx, top, bottom):
+    score = 0
+    bos_idx = bos["bos_index"]
+    zone_type = bos["type"]
+    zone_size = top - bottom
+    if zone_size <= 0:
+        return 0
+    
+    atr = calculate_atr(candles, 14)
+    if atr and atr > 0 and zone_size <= atr * OB_MAX_SIZE_ATR_MULT:
+        score += 1
+    elif not atr:
+        score += 1
+    
+    vols = [float(c.get("volume", 0) or 0) for c in candles[-50:]]
+    avg_v = sum(vols) / len(vols) if vols else 0
+    anchor_vol = float(candles[anchor_idx].get("volume", 0) or 0)
+    if avg_v > 0 and anchor_vol >= avg_v * OB_MIN_VOLUME_RATIO:
+        score += 1
+    elif avg_v <= 0:
+        score += 1
+    
+    bars_since = len(candles) - 1 - bos_idx
+    if bars_since <= OB_MAX_BOS_AGE:
+        score += 1
+    
+    pen = 0
+    for i in range(bos_idx + 1, len(candles)):
+        ch, cl = float(candles[i]["high"]), float(candles[i]["low"])
+        if ch >= bottom and cl <= top:
+            if min(ch, top) - max(cl, bottom) > zone_size * OB_MAX_PENETRATION_PCT:
+                pen += 1
+    if pen == 0:
+        score += 1
+    
+    ema = calculate_ema(candles, OB_EMA_PERIOD)
+    last_close = float(candles[-1]["close"])
+    if ema:
+        if (zone_type == "BULL" and last_close > ema) or (zone_type == "BEAR" and last_close < ema):
+            score += 1
+    
+    return score
 
 # ==============================================================================
-# 23. CRÉATION ZONE OB POC (avec bougie FluxCharts)
+# 22. CRÉATION ZONE OB
 # ==============================================================================
 
 def create_ob_zone_poc(candles, bos, existing_zones):
@@ -743,26 +935,40 @@ def create_ob_zone_poc(candles, bos, existing_zones):
     is_bull = bos["type"] == "BULL"
     if bos_idx <= swing_idx:
         return None
+    
     poc, _ = find_poc(candles, swing_idx, bos_idx)
     if poc is None:
         return None
+    
     touches = count_touches_poc(candles, swing_idx, bos_idx, poc)
     if touches < MIN_TOUCHES_POC:
         return None
-    # ✅ Utilisation de la fonction corrigée
+    
     anchor_idx = find_best_poc_candle(candles, swing_idx, bos_idx, poc, is_bull)
     if anchor_idx is None:
         return None
+    
     if GAP_FILTER_ENABLED and has_gap_between(candles, anchor_idx, bos_idx, is_bull):
         return None
+    
     top = float(candles[anchor_idx]["high"])
     bottom = float(candles[anchor_idx]["low"])
     if top <= bottom:
         return None
+    
     if OVERLAP_FILTER_ENABLED and ob_overlaps_active(existing_zones, top, bottom):
         return None
-    liquidity = 3
-    quality = calculate_quality_score(candles, bos, anchor_idx, top, bottom)
+    
+    score = calculate_ob_score(candles, bos, anchor_idx, top, bottom)
+    
+    if score < OB_MIN_SCORE:
+        log(f"⏭️ [{is_bull and 'BULL' or 'BEAR'}] Zone refusée — {score}/5 < {OB_MIN_SCORE}")
+        return None
+    
+    fibo = FIBO_LEVEL_BY_SCORE.get(score, 0.5)
+    stars = "⭐" * score
+    log(f"🆕 [{is_bull and 'BULL' or 'BEAR'}] Zone OB {score}/5 {stars} | Fibo={fibo} | top={top:.2f} bot={bottom:.2f}")
+    
     return {
         "type": bos["type"], "top": top, "bottom": bottom,
         "anchor_index": anchor_idx, "bos_index": bos_idx,
@@ -770,49 +976,12 @@ def create_ob_zone_poc(candles, bos, existing_zones):
         "active": True, "retested": False,
         "created_index": bos_idx,
         "order_placed": False, "order_id": None,
-        "quality_score": quality,
-        "liquidity_score": liquidity,
+        "quality_score": score,
+        "fibo_level": fibo,
     }
 
-def calculate_quality_score(candles, bos, anchor_idx, top, bottom):
-    score = 0
-    bos_idx = bos["bos_index"]
-    zone_type = bos["type"]
-    zone_size = top - bottom
-    if zone_size <= 0:
-        return 0
-    if abs(float(candles[bos_idx]["close"]) - bos["swing_price"]) >= zone_size * 2.0:
-        score += 1
-    vols = [float(c.get("volume", 0) or 0) for c in candles[-50:]]
-    avg_v = sum(vols) / len(vols) if vols else 0
-    if avg_v > 0 and float(candles[anchor_idx].get("volume", 0) or 0) >= avg_v * 1.3:
-        score += 1
-    ranges = [float(c["high"]) - float(c["low"]) for c in candles[-20:]]
-    avg_r = sum(ranges) / len(ranges) if ranges else 0
-    if avg_r > 0 and 0.5 <= zone_size / avg_r <= 2.0:
-        score += 1
-    body = abs(float(candles[bos_idx]["close"]) - float(candles[bos_idx]["open"]))
-    rng = float(candles[bos_idx]["high"]) - float(candles[bos_idx]["low"])
-    if rng > 0 and body / rng >= 0.6:
-        score += 1
-    if len(candles) - 1 - bos_idx <= 30:
-        score += 1
-    pen = 0
-    for i in range(bos_idx + 1, len(candles)):
-        ch, cl = float(candles[i]["high"]), float(candles[i]["low"])
-        if ch >= bottom and cl <= top and min(ch, top) - max(cl, bottom) > zone_size * 0.5:
-            pen += 1
-    if pen == 0:
-        score += 1
-    closes = [float(c["close"]) for c in candles]
-    if len(closes) >= 50:
-        ema = sum(closes[-50:]) / 50
-        if (zone_type == "BULL" and closes[-1] > ema) or (zone_type == "BEAR" and closes[-1] < ema):
-            score += 1
-    return score
-
 # ==============================================================================
-# 24. MISE À JOUR ZONES
+# 23. MISE À JOUR ZONES
 # ==============================================================================
 
 def update_zones(candles, zones, symbol):
@@ -834,7 +1003,7 @@ def update_zones(candles, zones, symbol):
     return zones
 
 # ==============================================================================
-# 25. VOLUME OB
+# 24. VOLUME OB
 # ==============================================================================
 
 async def calculate_volume_ob(connection, symbol, entry, sl):
@@ -873,19 +1042,25 @@ async def count_active_limit_orders(connection, symbol):
         return 999
 
 # ==============================================================================
-# 26. PLACEMENT ORDRE LIMIT — TECHNIQUE OB PURE
+# 25. PLACEMENT ORDRE LIMIT OB
 # ==============================================================================
 
-async def place_limit_order_ob(connection, symbol, zone, candles_m15):
+async def place_limit_order_ob(connection, symbol, zone):
     try:
         price = await connection.get_symbol_price(symbol)
         bid, ask = float(price["bid"]), float(price["ask"])
         spec = await connection.get_symbol_specification(symbol)
         digits = int(spec.get("digits", 5))
-
+        
+        zone_size = zone["top"] - zone["bottom"]
+        if zone_size <= 0:
+            return None
+        
+        fibo = zone.get("fibo_level", 0.5)
+        
         if zone["type"] == "BULL":
-            entry = normalize_price(zone["top"], digits)
-            sl = normalize_price(zone["bottom"], digits)
+            entry = normalize_price(zone["top"] - zone_size * fibo, digits)
+            sl = normalize_price(zone["bottom"] - zone_size * SL_BUFFER_FACTOR, digits)
             if ask <= entry:
                 return None
             risk = entry - sl
@@ -893,25 +1068,25 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
                 return None
             tp = normalize_price(entry + risk * RR_RATIO_OB, digits)
         else:
-            entry = normalize_price(zone["bottom"], digits)
-            sl = normalize_price(zone["top"], digits)
+            entry = normalize_price(zone["bottom"] + zone_size * fibo, digits)
+            sl = normalize_price(zone["top"] + zone_size * SL_BUFFER_FACTOR, digits)
             if bid >= entry:
                 return None
             risk = sl - entry
             if risk <= 0:
                 return None
             tp = normalize_price(entry - risk * RR_RATIO_OB, digits)
-
-        entry, sl, tp = validate_stops(spec, entry, sl, tp, digits)
-
+        
+        sl, tp = validate_stops(spec, entry, sl, tp, digits)
+        
         volume = await calculate_volume_ob(connection, symbol, entry, sl)
         if not volume or volume <= 0:
             return None
-
+        
         log(f"📋 [{symbol}] {'BUY' if zone['type']=='BULL' else 'SELL'} LIMIT OB | "
             f"Entry={entry} | SL={sl} | TP={tp} | Vol={volume} | "
-            f"Score={zone['quality_score']}/7")
-
+            f"Score={zone['quality_score']}/5 | Fibo={fibo}")
+        
         if zone["type"] == "BULL":
             order = await connection.create_limit_buy_order(
                 symbol=symbol, volume=volume, open_price=entry,
@@ -922,7 +1097,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
                 symbol=symbol, volume=volume, open_price=entry,
                 stop_loss=sl, take_profit=tp
             )
-
+        
         zone["order_placed"] = True
         zone["order_id"] = order.get("orderId") if isinstance(order, dict) else order
         return order
@@ -931,7 +1106,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
         return None
 
 # ==============================================================================
-# 27. CLEANUP ZONES
+# 26. CLEANUP + INVALIDATION OB
 # ==============================================================================
 
 async def cleanup_zones(connection, symbol):
@@ -948,11 +1123,7 @@ async def cleanup_zones(connection, symbol):
     except Exception:
         pass
 
-# ==============================================================================
-# 28. INVALIDATION DES ORDRES LIMIT
-# ==============================================================================
-
-async def invalidate_limit_orders(connection, symbol, zones, candles):
+async def invalidate_limit_orders(connection, symbol, candles):
     if symbol not in ob_zones:
         return
     try:
@@ -962,14 +1133,14 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
             return
         price_info = await connection.get_symbol_price(symbol)
         current_price = (float(price_info["bid"]) + float(price_info["ask"])) / 2
-
+        
         for order in symbol_orders:
             order_id = order.get("id") or order.get("orderId")
             order_price = float(order.get("openPrice", 0))
             order_time = order.get("time") or order.get("brokerTime")
             if not order_id:
                 continue
-
+            
             zone = None
             for z in ob_zones[symbol]:
                 if z.get("order_id") == order_id:
@@ -977,7 +1148,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
                     break
             if zone is None:
                 continue
-
+            
             if not zone.get("active", False):
                 log(f"❌ [{symbol}] Zone invalidée → annulation {order_id}")
                 try:
@@ -987,17 +1158,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
                 except Exception:
                     pass
                 continue
-
-            if SWEEP_DETECTION_ENABLED and detect_liquidity_sweep(candles, zone):
-                log(f"🌊 [{symbol}] Sweep → annulation {order_id}")
-                try:
-                    await connection.cancel_order(order_id)
-                    zone["order_placed"] = False
-                    zone["order_id"] = None
-                except Exception:
-                    pass
-                continue
-
+            
             zone_size = zone["top"] - zone["bottom"]
             if zone_size > 0 and abs(current_price - order_price) > zone_size * MAX_DISTANCE_FACTOR:
                 log(f"❌ [{symbol}] Prix trop loin → annulation {order_id}")
@@ -1008,7 +1169,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
                 except Exception:
                     pass
                 continue
-
+            
             if order_time:
                 try:
                     if isinstance(order_time, str):
@@ -1032,7 +1193,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
         log(f"❌ [{symbol}] Erreur invalidation : {e}")
 
 # ==============================================================================
-# 29. GESTION POSITIONS OB
+# 27. GESTION POSITIONS OB
 # ==============================================================================
 
 async def manage_positions_ob(connection):
@@ -1052,18 +1213,18 @@ async def manage_positions_ob(connection):
                 risk = abs(entry - sl)
                 if risk <= 0:
                     continue
-
+                
                 state = ensure_position_state(symbol)
                 if state["initial_risk"] <= 0:
                     state["initial_risk"] = risk
                 ir = state["initial_risk"]
-
+                
                 ptype = pos.get("type")
-
+                
                 if ptype == "POSITION_TYPE_BUY":
                     profit = current - entry
                     if profit >= ir * BREAK_EVEN_R_OB and sl < entry:
-                        log(f"🟢 [{symbol}] BE BUY #{pos['id']} SL {sl} → {entry}")
+                        log(f"🛡️ [{symbol}] BE BUY #{pos['id']} SL {sl} → {entry}")
                         await connection.modify_position(pos["id"], stop_loss=entry, take_profit=pos.get("takeProfit"))
                         sl = entry
                         state["r_reached"] = True
@@ -1072,11 +1233,11 @@ async def manage_positions_ob(connection):
                         if new_sl > sl:
                             log(f"📈 [{symbol}] Trailing BUY #{pos['id']} SL {sl} → {new_sl}")
                             await connection.modify_position(pos["id"], stop_loss=new_sl, take_profit=pos.get("takeProfit"))
-
+                
                 elif ptype == "POSITION_TYPE_SELL":
                     profit = entry - current
                     if profit >= ir * BREAK_EVEN_R_OB and sl > entry:
-                        log(f"🔴 [{symbol}] BE SELL #{pos['id']} SL {sl} → {entry}")
+                        log(f"🛡️ [{symbol}] BE SELL #{pos['id']} SL {sl} → {entry}")
                         await connection.modify_position(pos["id"], stop_loss=entry, take_profit=pos.get("takeProfit"))
                         sl = entry
                         state["r_reached"] = True
@@ -1085,14 +1246,14 @@ async def manage_positions_ob(connection):
                         if new_sl < sl:
                             log(f"📉 [{symbol}] Trailing SELL #{pos['id']} SL {sl} → {new_sl}")
                             await connection.modify_position(pos["id"], stop_loss=new_sl, take_profit=pos.get("takeProfit"))
-
+            
             except Exception as e:
                 log(f"[{symbol}] Erreur OB : {e}")
     except Exception as e:
         log(f"Erreur OB globale : {e}")
 
 # ==============================================================================
-# 30. ANALYSE OB
+# 28. ANALYSE OB
 # ==============================================================================
 
 async def analyze_ob(account, connection, symbol):
@@ -1101,10 +1262,9 @@ async def analyze_ob(account, connection, symbol):
         candles = await get_candles(account, symbol, TIMEFRAME_ENTRY, CANDLE_COUNT_OB)
         if not candles or len(candles) < SWING_LEN * 3:
             return
-
-        if symbol in ob_zones:
-            await invalidate_limit_orders(connection, symbol, ob_zones[symbol], candles)
-
+        
+        await invalidate_limit_orders(connection, symbol, candles)
+        
         sh, sl = find_swing_highs_lows(candles, SWING_LEN)
         bos_list = detect_bos(candles, sh, sl)
         if symbol not in ob_zones:
@@ -1117,11 +1277,10 @@ async def analyze_ob(account, connection, symbol):
             if any(zz.get("anchor_index") == z["anchor_index"] and zz["type"] == z["type"] for zz in ob_zones[symbol]):
                 continue
             ob_zones[symbol].append(z)
-            log(f"🆕 [{symbol}] Zone OB POC {z['type']} top={z['top']} bot={z['bottom']} POC={z.get('poc')} score={z['quality_score']}/7")
-
+        
         ob_zones[symbol] = update_zones(candles, ob_zones[symbol], symbol)
         active = [z for z in ob_zones[symbol] if z["active"]]
-
+        
         last_close = float(candles[-1]["close"])
         def dist(z):
             if last_close > z["top"]: return last_close - z["top"]
@@ -1129,23 +1288,23 @@ async def analyze_ob(account, connection, symbol):
             return 0.0
         active.sort(key=lambda z: (-z.get("quality_score", 0), dist(z)))
         active = active[:MAX_ZONES_TO_TRACK]
-
+        
         n_orders = await count_active_limit_orders(connection, symbol)
         log(f"[{symbol}] OB zones={len(active)} | Ordres LIMIT={n_orders}/{MAX_LIMIT_ORDERS_PER_SYMBOL}")
-
+        
         for z in active:
             if n_orders >= MAX_LIMIT_ORDERS_PER_SYMBOL:
                 break
             if z.get("order_placed", False):
                 continue
-            r = await place_limit_order_ob(connection, symbol, z, candles)
+            r = await place_limit_order_ob(connection, symbol, z)
             if r is not None:
                 n_orders += 1
     except Exception as e:
         log(f"❌ [{symbol}] Erreur analyse OB : {e}")
 
 # ==============================================================================
-# 31. HEALTH CHECK
+# 29. HEALTH CHECK
 # ==============================================================================
 
 async def health_check_server():
@@ -1171,14 +1330,14 @@ async def health_check_server():
         await server.serve_forever()
 
 # ==============================================================================
-# 32. BOUCLE
+# 30. BOUCLE
 # ==============================================================================
 
 async def trading_loop(account, connection):
     while True:
         try:
-            for s in STOCH_SYMBOLS:
-                await analyze_stoch(account, connection, s)
+            for s in PA_SYMBOLS:
+                await analyze_pa(account, connection, s)
                 await asyncio.sleep(1)
             for s in OB_SYMBOLS:
                 await analyze_ob(account, connection, s)
@@ -1190,17 +1349,16 @@ async def trading_loop(account, connection):
             await asyncio.sleep(10)
 
 # ==============================================================================
-# 33. MAIN
+# 31. MAIN
 # ==============================================================================
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS BOT — Step Index + XAUUSD", flush=True)
+    print("🚀 ARKAS BOT — PA Multi-Critères + OB 5★ Fibo", flush=True)
     print("=" * 60, flush=True)
-    print(f"STOCH : {', '.join(STOCH_SYMBOLS)}", flush=True)
-    print(f"OB    : {', '.join(OB_SYMBOLS)}", flush=True)
-    print(f"OB : ordres LIMIT | Bougie FluxCharts (POC + extrême)", flush=True)
-    print(f"SL = bord zone | TP = 2R | BE +1R | Trailing +1.5R", flush=True)
+    print(f"PA    : {', '.join(PA_SYMBOLS)} (Score ≥ {PA_MIN_SCORE})", flush=True)
+    print(f"OB    : {', '.join(OB_SYMBOLS)} (Score ≥ {OB_MIN_SCORE}★)", flush=True)
+    print(f"Timeframe : {TIMEFRAME_ENTRY}", flush=True)
     print(f"Région : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
