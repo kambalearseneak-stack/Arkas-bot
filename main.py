@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS STOCHASTIC MTF BOT — PRO 1.2 (5 actifs)
+# ARKAS STOCHASTIC MTF BOT — PRO 2.1
+# MARKET + Croisement hors zone 50 + Anti-Répétition + BE + Trailing ATR
 # ==============================================================================
 
 # ==============================================================================
@@ -19,7 +20,7 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0
 METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 
 # ==============================================================================
-# 2. MARCHÉS — 5 actifs
+# 2. MARCHÉS
 # ==============================================================================
 
 SYMBOLS = [
@@ -30,11 +31,10 @@ SYMBOLS = [
     "Volatility 25 Index"
 ]
 
-TIMEFRAME_ANALYSIS = "1h"
 TIMEFRAME_ENTRY = "15m"
 
 # ==============================================================================
-# 3. STOCHASTIQUE (5, 3, 3)
+# 3. STOCHASTIQUE (5, 3, 3) — comme MT5
 # ==============================================================================
 
 STOCH_K = 5
@@ -45,11 +45,12 @@ LEVEL_BUY = 10
 LEVEL_NEUTRAL = 50
 LEVEL_SELL = 90
 
-H1_BUY_ZONE = 20
-H1_SELL_ZONE = 80
-
 ALERT_OVERBOUGHT = 85
 ALERT_OVERSOLD = 15
+
+# Filtre zone neutre — on évite les croisements dans le bruit
+ZONE_NEUTRAL_LOW = 45
+ZONE_NEUTRAL_HIGH = 55
 
 # ==============================================================================
 # 4. MONEY MANAGEMENT — Lots minimums par actif
@@ -72,7 +73,6 @@ VOLUME_LIMITS = {
 }
 
 MAX_POSITIONS_PER_SYMBOL = 1
-MAX_ORDERS_PER_SYMBOL = 1
 
 DEFAULT_SL_POINTS = {
     "Step Index": 50.0,
@@ -83,33 +83,26 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 5. ORDRES LIMIT
-# ==============================================================================
-
-LIMIT_OFFSET_ATR = 0.5
-ORDER_EXPIRATION_SECONDS = 3600
-
-# ==============================================================================
-# 6. GESTION POSITION
+# 5. GESTION POSITION
 # ==============================================================================
 
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 2.0
-ATR_TRAIL_MULTIPLIER = 2.0
-ATR_MIN_TRAIL_STEP = 0.5
+ATR_SL_MULTIPLIER = 2.0       # SL initial = ATR × 2
+ATR_TRAIL_MULTIPLIER = 2.0    # Trailing = prix ∓ ATR × 2
+ATR_MIN_TRAIL_STEP = 0.5      # Pas minimum entre 2 modifs
 
-BREAK_EVEN_TRIGGER_R = 1.0
-RISK_REWARD_RATIO = 2.0
+BREAK_EVEN_TRIGGER_R = 1.0    # BE activé à +1R
+RISK_REWARD_RATIO = 2.0       # TP initial = 2R
 
 # ==============================================================================
-# 7. EXECUTION
+# 6. EXECUTION
 # ==============================================================================
 
 SCAN_INTERVAL = 15
 CANDLES_LIMIT = 300
 
 # ==============================================================================
-# 8. SPREAD
+# 7. SPREAD
 # ==============================================================================
 
 MAX_SPREAD = {
@@ -121,11 +114,11 @@ MAX_SPREAD = {
 }
 
 # ==============================================================================
-# 9. ANTI-SPAM + ÉTAT
+# 8. ÉTAT PAR SYMBOLE
 # ==============================================================================
 
-LAST_TRADED_CANDLE = {}
-POSITION_STATE = {}
+LAST_SIGNAL = {}         # {symbol: "BUY" | "SELL"}
+POSITION_STATE = {}      # {symbol: {"r_reached": bool, "alerted": bool, "initial_risk": float}}
 
 def reset_position_state(symbol):
     POSITION_STATE[symbol] = {"r_reached": False, "alerted": False, "initial_risk": 0.0}
@@ -136,7 +129,7 @@ def ensure_position_state(symbol):
     return POSITION_STATE[symbol]
 
 # ==============================================================================
-# 10. UTILS
+# 9. UTILS
 # ==============================================================================
 
 def log(message):
@@ -153,7 +146,7 @@ def normalize_volume(volume, minimum, maximum, step):
     return round(steps * step, 4)
 
 # ==============================================================================
-# 11. STOCHASTIQUE ALIGNÉ
+# 10. STOCHASTIQUE ALIGNÉ
 # ==============================================================================
 
 def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
@@ -185,7 +178,7 @@ def calculate_stochastic(candles, k_period=5, d_period=3, slowing=3):
     return {"k": aligned_k, "d": d_line}
 
 # ==============================================================================
-# 12. ATR
+# 11. ATR
 # ==============================================================================
 
 def calculate_atr(candles, period=ATR_PERIOD):
@@ -205,7 +198,7 @@ def calculate_atr(candles, period=ATR_PERIOD):
     return sum(trs[-period:]) / period
 
 # ==============================================================================
-# 13. STRUCTURE
+# 12. STRUCTURE
 # ==============================================================================
 
 def detect_structure(candles, lookback=5):
@@ -271,7 +264,7 @@ def structure_confirms_sell(candles, current_price, lookback=5):
     return wick_rejection and below_swing
 
 # ==============================================================================
-# 14. RETOURNEMENTS
+# 13. RETOURNEMENTS
 # ==============================================================================
 
 def detect_bullish_reversal(candles_m15, stoch):
@@ -317,7 +310,7 @@ def detect_bearish_reversal(candles_m15, stoch):
     return False
 
 # ==============================================================================
-# 15. BOUGIES
+# 14. BOUGIES
 # ==============================================================================
 
 async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
@@ -331,7 +324,7 @@ async def get_candles(account, symbol, timeframe, limit=CANDLES_LIMIT):
         return None
 
 # ==============================================================================
-# 16. VÉRIF SYMBOLE
+# 15. VÉRIF SYMBOLE
 # ==============================================================================
 
 async def is_symbol_tradable(connection, symbol):
@@ -348,7 +341,7 @@ async def is_symbol_tradable(connection, symbol):
         return False, None
 
 # ==============================================================================
-# 17. VOLUME
+# 16. VOLUME
 # ==============================================================================
 
 def get_fixed_lot(symbol, spec):
@@ -361,7 +354,7 @@ def get_fixed_lot(symbol, spec):
     return volume
 
 # ==============================================================================
-# 18. STOPS
+# 17. STOPS
 # ==============================================================================
 
 def get_min_stop_distance(spec, digits):
@@ -398,52 +391,7 @@ def can_modify_sl(spec, current_price, new_sl, digits):
     return abs(current_price - new_sl) >= min_distance
 
 # ==============================================================================
-# 19. CLEANUP ORDRES EXPIRÉS
-# ==============================================================================
-
-async def cleanup_expired_orders(connection, symbol):
-    try:
-        orders = await connection.get_orders()
-        symbol_orders = [o for o in orders if o.get("symbol") == symbol]
-
-        if not symbol_orders:
-            return
-
-        now = datetime.now(timezone.utc)
-
-        for order in symbol_orders:
-            order_id = order.get("id")
-            created = order.get("time") or order.get("brokerTime")
-
-            if not created:
-                continue
-
-            try:
-                if isinstance(created, str):
-                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    if created_dt.tzinfo is None:
-                        created_dt = created_dt.replace(tzinfo=timezone.utc)
-                else:
-                    created_dt = created
-                    if created_dt.tzinfo is None:
-                        created_dt = created_dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-
-            age = (now - created_dt).total_seconds()
-            if age > ORDER_EXPIRATION_SECONDS:
-                log(f"⏰ [{symbol}] Ordre {order_id} expiré ({age:.0f}s) → annulation")
-                try:
-                    await connection.cancel_order(order_id)
-                    log(f"🗑️ [{symbol}] Ordre {order_id} annulé")
-                except Exception as e:
-                    log(f"⚠️ [{symbol}] Impossible d'annuler {order_id} : {e}")
-
-    except Exception as e:
-        log(f"❌ [{symbol}] Erreur cleanup : {e}")
-
-# ==============================================================================
-# 20. GESTION POSITIONS
+# 18. GESTION POSITIONS
 # ==============================================================================
 
 async def manage_open_positions(account, connection, symbol):
@@ -548,7 +496,7 @@ async def manage_open_positions(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur gestion positions : {e}")
 
 # ==============================================================================
-# 21. ANALYSE MTF
+# 19. ANALYSE MTF — MARKET + Zone neutre + Anti-Répétition
 # ==============================================================================
 
 async def analyze_and_trade(account, connection, symbol):
@@ -559,37 +507,15 @@ async def analyze_and_trade(account, connection, symbol):
 
         digits = int(spec.get("digits", 2))
 
+        # 1. Positions actives
         positions = await connection.get_positions()
         active_positions = [p for p in positions if p.get("symbol") == symbol]
 
         if len(active_positions) >= MAX_POSITIONS_PER_SYMBOL:
             await manage_open_positions(account, connection, symbol)
-            await cleanup_expired_orders(connection, symbol)
             return
 
-        orders = await connection.get_orders()
-        active_orders = [o for o in orders if o.get("symbol") == symbol]
-
-        await cleanup_expired_orders(connection, symbol)
-
-        if len(active_orders) >= MAX_ORDERS_PER_SYMBOL:
-            log(f"⏸️ [{symbol}] Ordre limit déjà en attente")
-            return
-
-        candles_h1 = await get_candles(account, symbol, TIMEFRAME_ANALYSIS)
-        stoch_h1 = calculate_stochastic(candles_h1, STOCH_K, STOCH_D, STOCH_SLOWING)
-        if not stoch_h1:
-            return
-
-        h1_k, h1_d = stoch_h1["k"][-1], stoch_h1["d"][-1]
-        h1_buy_setup = h1_k <= H1_BUY_ZONE and h1_d <= H1_BUY_ZONE
-        h1_sell_setup = h1_k >= H1_SELL_ZONE and h1_d >= H1_SELL_ZONE
-
-        if not (h1_buy_setup or h1_sell_setup):
-            if h1_k <= 30 or h1_k >= 70:
-                log(f"🔍 [{symbol}] H1 proche : K={h1_k:.1f} D={h1_d:.1f}")
-            return
-
+        # 2. Récupération M15
         candles_m15 = await get_candles(account, symbol, TIMEFRAME_ENTRY)
         stoch_m15 = calculate_stochastic(candles_m15, STOCH_K, STOCH_D, STOCH_SLOWING)
         if not stoch_m15 or len(stoch_m15["k"]) < 3:
@@ -599,83 +525,95 @@ async def analyze_and_trade(account, connection, symbol):
         curr_k, curr_d = stoch_m15["k"][-1], stoch_m15["d"][-1]
         older_k = stoch_m15["k"][-3]
 
-        buy_confirmed = h1_buy_setup and prev_k <= prev_d and curr_k > curr_d and curr_k > older_k
-        sell_confirmed = h1_sell_setup and prev_k >= prev_d and curr_k < curr_d and curr_k < older_k
+        # 3. Détection croisement M15 avec momentum
+        cross_up = prev_k <= prev_d and curr_k > curr_d and curr_k > older_k
+        cross_down = prev_k >= prev_d and curr_k < curr_d and curr_k < older_k
 
-        if not (buy_confirmed or sell_confirmed):
-            log(f"🔍 [{symbol}] M15 attente : K={curr_k:.1f} D={curr_d:.1f}")
+        if not (cross_up or cross_down):
+            log(f"🔍 [{symbol}] M15 : K={curr_k:.1f} D={curr_d:.1f}")
             return
 
-        last_candle_time = candles_m15[-1].get("time") or candles_m15[-1].get("brokerTime")
-        if last_candle_time is None:
+        # 4. Filtre ZONE NEUTRE 45-55
+        if cross_up and curr_k >= ZONE_NEUTRAL_LOW:
+            log(f"🚫 [{symbol}] Croisement haussier ignoré — K={curr_k:.1f} ≥ {ZONE_NEUTRAL_LOW}")
             return
-        if LAST_TRADED_CANDLE.get(symbol) == last_candle_time:
+        if cross_down and curr_k <= ZONE_NEUTRAL_HIGH:
+            log(f"🚫 [{symbol}] Croisement baissier ignoré — K={curr_k:.1f} ≤ {ZONE_NEUTRAL_HIGH}")
             return
 
+        signal_type = "BUY" if cross_up else "SELL"
+
+        # 5. Anti-répétition : même signal que la dernière fois → skip
+        if LAST_SIGNAL.get(symbol) == signal_type:
+            log(f"⏸️ [{symbol}] Signal {signal_type} déjà traité — attente inversion")
+            return
+
+        # 6. Prix + spread
         price_info = await connection.get_symbol_price(symbol)
         bid, ask = float(price_info["bid"]), float(price_info["ask"])
-
-        if buy_confirmed and not structure_confirms_buy(candles_m15, ask):
-            log(f"🚫 [{symbol}] Structure prix invalide BUY")
-            return
-        if sell_confirmed and not structure_confirms_sell(candles_m15, bid):
-            log(f"🚫 [{symbol}] Structure prix invalide SELL")
-            return
-
         spread = ask - bid
+
         if spread > MAX_SPREAD.get(symbol, 999.0):
             log(f"🚫 [{symbol}] Spread trop élevé ({spread:.2f})")
             return
 
+        # 7. ATR
         atr_m15 = calculate_atr(candles_m15, ATR_PERIOD)
         if not atr_m15 or atr_m15 <= 0:
             log(f"⚠️ [{symbol}] ATR indisponible")
             return
 
-        offset = atr_m15 * LIMIT_OFFSET_ATR
+        # 8. Structure de prix
+        if cross_up and not structure_confirms_buy(candles_m15, ask):
+            log(f"🚫 [{symbol}] Structure prix invalide BUY")
+            return
+        if cross_down and not structure_confirms_sell(candles_m15, bid):
+            log(f"🚫 [{symbol}] Structure prix invalide SELL")
+            return
+
         volume = get_fixed_lot(symbol, spec)
 
-        if buy_confirmed:
-            entry_price = normalize_price(bid - offset, digits)
-            sl_price = normalize_price(entry_price - atr_m15 * ATR_SL_MULTIPLIER, digits)
-            tp_price = normalize_price(entry_price + atr_m15 * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO, digits)
-            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
+        # 9. Ordre MARKET
+        sl_distance = atr_m15 * ATR_SL_MULTIPLIER
+        tp_distance = sl_distance * RISK_REWARD_RATIO
 
-            log(f"📋 [{symbol}] BUY_LIMIT | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+        if cross_up:
+            sl_price = normalize_price(ask - sl_distance, digits)
+            tp_price = normalize_price(ask + tp_distance, digits)
+            sl_price, tp_price = validate_stops(spec, ask, sl_price, tp_price, digits)
+
+            log(f"🚀 [{symbol}] ACHAT MARKET | Entry={ask} | SL={sl_price} | TP={tp_price} | Vol={volume}")
             try:
-                result = await connection.create_limit_buy_order(
-                    symbol=symbol, volume=volume, open_price=entry_price,
-                    stop_loss=sl_price, take_profit=tp_price
+                await connection.create_market_buy_order(
+                    symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price
                 )
-                order_id = result.get("orderId") if isinstance(result, dict) else result
-                log(f"✅ [{symbol}] BUY_LIMIT placé | orderId={order_id}")
-                LAST_TRADED_CANDLE[symbol] = last_candle_time
+                log(f"✅ [{symbol}] ACHAT exécuté")
+                LAST_SIGNAL[symbol] = "BUY"
+                reset_position_state(symbol)
             except Exception as e:
-                log(f"❌ [{symbol}] BUY_LIMIT erreur : {e}")
+                log(f"❌ [{symbol}] ACHAT erreur : {e}")
 
-        elif sell_confirmed:
-            entry_price = normalize_price(ask + offset, digits)
-            sl_price = normalize_price(entry_price + atr_m15 * ATR_SL_MULTIPLIER, digits)
-            tp_price = normalize_price(entry_price - atr_m15 * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO, digits)
-            sl_price, tp_price = validate_stops(spec, entry_price, sl_price, tp_price, digits)
+        elif cross_down:
+            sl_price = normalize_price(bid + sl_distance, digits)
+            tp_price = normalize_price(bid - tp_distance, digits)
+            sl_price, tp_price = validate_stops(spec, bid, sl_price, tp_price, digits)
 
-            log(f"📋 [{symbol}] SELL_LIMIT | Entry={entry_price} | SL={sl_price} | TP={tp_price} | Vol={volume}")
+            log(f"🔻 [{symbol}] VENTE MARKET | Entry={bid} | SL={sl_price} | TP={tp_price} | Vol={volume}")
             try:
-                result = await connection.create_limit_sell_order(
-                    symbol=symbol, volume=volume, open_price=entry_price,
-                    stop_loss=sl_price, take_profit=tp_price
+                await connection.create_market_sell_order(
+                    symbol=symbol, volume=volume, stop_loss=sl_price, take_profit=tp_price
                 )
-                order_id = result.get("orderId") if isinstance(result, dict) else result
-                log(f"✅ [{symbol}] SELL_LIMIT placé | orderId={order_id}")
-                LAST_TRADED_CANDLE[symbol] = last_candle_time
+                log(f"✅ [{symbol}] VENTE exécutée")
+                LAST_SIGNAL[symbol] = "SELL"
+                reset_position_state(symbol)
             except Exception as e:
-                log(f"❌ [{symbol}] SELL_LIMIT erreur : {e}")
+                log(f"❌ [{symbol}] VENTE erreur : {e}")
 
     except Exception as e:
         log(f"❌ [{symbol}] Erreur analyse/trading : {e}")
 
 # ==============================================================================
-# 22. BOUCLE 24/7
+# 20. BOUCLE 24/7
 # ==============================================================================
 
 async def trading_loop(account, connection):
@@ -689,7 +627,7 @@ async def trading_loop(account, connection):
             await asyncio.sleep(10)
 
 # ==============================================================================
-# 23. HEALTH CHECK HTTP POUR RENDER
+# 21. HEALTH CHECK HTTP POUR RENDER
 # ==============================================================================
 
 async def health_check_server():
@@ -721,18 +659,19 @@ async def health_check_server():
         await server.serve_forever()
 
 # ==============================================================================
-# 24. MAIN
+# 22. MAIN
 # ==============================================================================
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 1.2 (5 actifs)", flush=True)
+    print("🚀 ARKAS STOCHASTIC MTF BOT — PRO 2.1", flush=True)
     print("=" * 60, flush=True)
     print(f"Symboles : {', '.join(SYMBOLS)}", flush=True)
-    print(f"Timeframes : {TIMEFRAME_ANALYSIS} → {TIMEFRAME_ENTRY}", flush=True)
+    print(f"Timeframe : {TIMEFRAME_ENTRY}", flush=True)
     print(f"Lots : " + " | ".join([f"{s}={LOT_PER_SYMBOL[s]}" for s in SYMBOLS]), flush=True)
-    print(f"Type d'ordre : LIMIT (offset {LIMIT_OFFSET_ATR}× ATR)", flush=True)
-    print(f"Expiration ordre : {ORDER_EXPIRATION_SECONDS}s", flush=True)
+    print(f"Type d'ordre : MARKET", flush=True)
+    print(f"Filtre zone neutre : {ZONE_NEUTRAL_LOW}-{ZONE_NEUTRAL_HIGH} (skip)", flush=True)
+    print(f"Anti-répétition : même signal non rejoué", flush=True)
     print(f"BE à +{BREAK_EVEN_TRIGGER_R}R | Trailing ATR × {ATR_TRAIL_MULTIPLIER}", flush=True)
     print(f"TP initial : {RISK_REWARD_RATIO}R", flush=True)
     print(f"Région MetaApi : {METAAPI_REGION}", flush=True)
@@ -756,7 +695,7 @@ async def main():
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized(60)
-        log("🟢 BOT PRO CONNECTÉ — 5 actifs + LIMIT + BE + Trailing")
+        log("🟢 BOT PRO 2.1 CONNECTÉ")
 
         await trading_loop(account, connection)
 
