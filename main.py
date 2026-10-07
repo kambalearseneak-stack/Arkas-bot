@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 # ==============================================================================
-# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks technique pure)
+# ARKAS BOT — Step Index (Stoch) + XAUUSD (Order Blocks FluxCharts)
 # Ordres LIMIT | SL = bord zone | TP = 2R | BE +1R | Trailing 1.5R
+# Bougie OB choisie selon méthode FluxCharts (POC + extrême)
 # ==============================================================================
 
 # ==============================================================================
@@ -20,7 +21,7 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0
 METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 
 # ==============================================================================
-# 2. MARCHÉS — 1 indice + Gold
+# 2. MARCHÉS
 # ==============================================================================
 
 STOCH_SYMBOLS = ["Step Index"]
@@ -64,7 +65,7 @@ DEFAULT_SL_POINTS = {
 }
 
 # ==============================================================================
-# 4. ORDER BLOCKS — Technique pure
+# 4. ORDER BLOCKS
 # ==============================================================================
 
 SWING_LEN = 5
@@ -96,22 +97,15 @@ TRAILING_DISTANCE_R_OB = 0.7
 # 4bis. INVALIDATION + SL TECHNIQUE OB PURE
 # ==============================================================================
 
-MIN_LIQUIDITY_SCORE = 0        # Filtre liquidité désactivé
-
+MIN_LIQUIDITY_SCORE = 0
 MAX_ORDER_AGE_HOURS = 4
 MAX_DISTANCE_FACTOR = 3.0
 SWEEP_DETECTION_ENABLED = True
 
-# ✅ SL = bord opposé de la zone (technique OB pure)
-SL_LIQUIDITY_BUFFER_FACTOR = {
-    "XAUUSD": 0.0,
-}
+SL_LIQUIDITY_BUFFER_FACTOR = {"XAUUSD": 0.0}
+SL_MIN_BUFFER_POINTS = {"XAUUSD": 0.0}
 
-SL_MIN_BUFFER_POINTS = {
-    "XAUUSD": 0.0,
-}
-
-SL_USE_STRUCTURE = False       # SL structurel désactivé
+SL_USE_STRUCTURE = False
 SL_STRUCTURE_LOOKBACK = 20
 SL_STRUCTURE_MARGIN_POINTS = {}
 
@@ -603,7 +597,7 @@ def detect_bos(candles, swing_highs, swing_lows):
     return bos_list
 
 # ==============================================================================
-# 19. POC
+# 19. POC — Point of Control
 # ==============================================================================
 
 def find_poc(candles, from_idx, to_idx, n_bins=POC_BINS):
@@ -649,29 +643,43 @@ def count_touches_poc(candles, from_idx, to_idx, poc):
             count += 1
     return count
 
+# ==============================================================================
+# 20. ✅ FONCTION CORRIGÉE — Choix de la bougie OB (FluxCharts)
+# ==============================================================================
+
 def find_best_poc_candle(candles, from_idx, to_idx, poc, is_bull):
+    """
+    Trouve LA bougie OB conforme FluxCharts :
+      - Elle touche le POC
+      - Pour BULL : low le plus bas parmi les bougies qui touchent le POC
+      - Pour BEAR : high le plus haut parmi les bougies qui touchent le POC
+    """
     if poc is None or from_idx >= to_idx:
         return None
+
     best_idx = None
-    run_extreme = None
+    best_extreme = None
+
     for i in range(to_idx, from_idx - 1, -1):
         lo = float(candles[i]["low"])
         hi = float(candles[i]["high"])
         touches = lo <= poc <= hi
+        if not touches:
+            continue
+
         if is_bull:
-            if run_extreme is None or lo < run_extreme:
-                run_extreme = lo
-            if touches and lo == run_extreme:
+            if best_extreme is None or lo < best_extreme:
+                best_extreme = lo
                 best_idx = i
         else:
-            if run_extreme is None or hi > run_extreme:
-                run_extreme = hi
-            if touches and hi == run_extreme:
+            if best_extreme is None or hi > best_extreme:
+                best_extreme = hi
                 best_idx = i
+
     return best_idx
 
 # ==============================================================================
-# 20. GAP + OVERLAP
+# 21. GAP + OVERLAP
 # ==============================================================================
 
 def has_gap_between(candles, anchor_idx, bos_idx, is_bull):
@@ -705,7 +713,7 @@ def ob_overlaps_active(zones, top, bottom):
     return False
 
 # ==============================================================================
-# 21. SWEEP (invalidation)
+# 22. SWEEP (invalidation)
 # ==============================================================================
 
 def detect_liquidity_sweep(candles, zone):
@@ -726,7 +734,7 @@ def detect_liquidity_sweep(candles, zone):
     return False
 
 # ==============================================================================
-# 22. CRÉATION ZONE OB POC
+# 23. CRÉATION ZONE OB POC (avec bougie FluxCharts)
 # ==============================================================================
 
 def create_ob_zone_poc(candles, bos, existing_zones):
@@ -741,6 +749,7 @@ def create_ob_zone_poc(candles, bos, existing_zones):
     touches = count_touches_poc(candles, swing_idx, bos_idx, poc)
     if touches < MIN_TOUCHES_POC:
         return None
+    # ✅ Utilisation de la fonction corrigée
     anchor_idx = find_best_poc_candle(candles, swing_idx, bos_idx, poc, is_bull)
     if anchor_idx is None:
         return None
@@ -803,7 +812,7 @@ def calculate_quality_score(candles, bos, anchor_idx, top, bottom):
     return score
 
 # ==============================================================================
-# 23. MISE À JOUR ZONES
+# 24. MISE À JOUR ZONES
 # ==============================================================================
 
 def update_zones(candles, zones, symbol):
@@ -825,7 +834,7 @@ def update_zones(candles, zones, symbol):
     return zones
 
 # ==============================================================================
-# 24. VOLUME OB
+# 25. VOLUME OB
 # ==============================================================================
 
 async def calculate_volume_ob(connection, symbol, entry, sl):
@@ -864,7 +873,7 @@ async def count_active_limit_orders(connection, symbol):
         return 999
 
 # ==============================================================================
-# 25. PLACEMENT ORDRE LIMIT — TECHNIQUE OB PURE
+# 26. PLACEMENT ORDRE LIMIT — TECHNIQUE OB PURE
 # ==============================================================================
 
 async def place_limit_order_ob(connection, symbol, zone, candles_m15):
@@ -922,7 +931,7 @@ async def place_limit_order_ob(connection, symbol, zone, candles_m15):
         return None
 
 # ==============================================================================
-# 26. CLEANUP ZONES
+# 27. CLEANUP ZONES
 # ==============================================================================
 
 async def cleanup_zones(connection, symbol):
@@ -940,7 +949,7 @@ async def cleanup_zones(connection, symbol):
         pass
 
 # ==============================================================================
-# 27. INVALIDATION DES ORDRES LIMIT
+# 28. INVALIDATION DES ORDRES LIMIT
 # ==============================================================================
 
 async def invalidate_limit_orders(connection, symbol, zones, candles):
@@ -1023,7 +1032,7 @@ async def invalidate_limit_orders(connection, symbol, zones, candles):
         log(f"❌ [{symbol}] Erreur invalidation : {e}")
 
 # ==============================================================================
-# 28. GESTION POSITIONS OB — BE + Trailing
+# 29. GESTION POSITIONS OB
 # ==============================================================================
 
 async def manage_positions_ob(connection):
@@ -1083,7 +1092,7 @@ async def manage_positions_ob(connection):
         log(f"Erreur OB globale : {e}")
 
 # ==============================================================================
-# 29. ANALYSE OB
+# 30. ANALYSE OB
 # ==============================================================================
 
 async def analyze_ob(account, connection, symbol):
@@ -1108,7 +1117,7 @@ async def analyze_ob(account, connection, symbol):
             if any(zz.get("anchor_index") == z["anchor_index"] and zz["type"] == z["type"] for zz in ob_zones[symbol]):
                 continue
             ob_zones[symbol].append(z)
-            log(f"🆕 [{symbol}] Zone OB POC {z['type']} top={z['top']} bot={z['bottom']} score={z['quality_score']}/7")
+            log(f"🆕 [{symbol}] Zone OB POC {z['type']} top={z['top']} bot={z['bottom']} POC={z.get('poc')} score={z['quality_score']}/7")
 
         ob_zones[symbol] = update_zones(candles, ob_zones[symbol], symbol)
         active = [z for z in ob_zones[symbol] if z["active"]]
@@ -1136,7 +1145,7 @@ async def analyze_ob(account, connection, symbol):
         log(f"❌ [{symbol}] Erreur analyse OB : {e}")
 
 # ==============================================================================
-# 30. HEALTH CHECK
+# 31. HEALTH CHECK
 # ==============================================================================
 
 async def health_check_server():
@@ -1162,7 +1171,7 @@ async def health_check_server():
         await server.serve_forever()
 
 # ==============================================================================
-# 31. BOUCLE
+# 32. BOUCLE
 # ==============================================================================
 
 async def trading_loop(account, connection):
@@ -1181,17 +1190,17 @@ async def trading_loop(account, connection):
             await asyncio.sleep(10)
 
 # ==============================================================================
-# 32. MAIN
+# 33. MAIN
 # ==============================================================================
 
 async def main():
     print("=" * 60, flush=True)
-    print("🚀 ARKAS BOT — Step Index + XAUUSD (OB technique pure)", flush=True)
+    print("🚀 ARKAS BOT — Step Index + XAUUSD", flush=True)
     print("=" * 60, flush=True)
     print(f"STOCH : {', '.join(STOCH_SYMBOLS)}", flush=True)
     print(f"OB    : {', '.join(OB_SYMBOLS)}", flush=True)
-    print(f"Entry OB : bord zone | SL : bord opposé | TP : 2R", flush=True)
-    print(f"Ordre OB : LIMIT", flush=True)
+    print(f"OB : ordres LIMIT | Bougie FluxCharts (POC + extrême)", flush=True)
+    print(f"SL = bord zone | TP = 2R | BE +1R | Trailing +1.5R", flush=True)
     print(f"Région : {METAAPI_REGION}", flush=True)
     print("=" * 60, flush=True)
 
