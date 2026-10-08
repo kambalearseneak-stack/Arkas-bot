@@ -15,7 +15,7 @@ from metaapi_cloud_sdk import MetaApi
 # ==============================================================================
 
 TOKEN = os.getenv("METAAPI_TOKEN")
-ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "fb767521-946d-40e4-b9cf-09e9b130f0dd")
+ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "9c6bca0d-fd91-4bce-bba3-22cb5bce1a0d")
 METAAPI_REGION = os.getenv("METAAPI_REGION", "london")
 
 # ==============================================================================
