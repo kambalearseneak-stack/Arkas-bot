@@ -1,368 +1,353 @@
-"""ARKAS TREND DONCHIAN — BACKTEST MOIS PAR MOIS — aucun ordre réel.
-Teste la stratégie sur CHAQUE mois séparément sur 3 ans.
-36 mois = 36 tests indépendants = vraie distribution des performances.
+"""ARKAS DONCHIAN LIVE BOT — démo Deriv via MetaApi.
+LIVE_MODE=true : passe des ordres réels sur le compte démo.
+6 sécurités dures NON CONTOURNABLES protègent contre les bugs.
 """
-import argparse
 import asyncio
 import os
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from collections import deque
 
 import numpy as np
 import pandas as pd
 from metaapi_cloud_sdk import MetaApi
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
-YEARS = float(os.getenv("BT_YEARS", "3.0"))
-RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = os.getenv("BT_TF", "1h")
-INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
 
-SPREAD_OVERRIDES = {
-    "XAUUSD": 0.30,
+SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
+TIMEFRAME = os.getenv("BT_TF", "1h")
+RISK_PCT = float(os.getenv("BT_RISK", "0.5"))
+MAX_POSITIONS = int(os.getenv("BT_MAX_POSITIONS", "2"))
+MAX_TOTAL_RISK_PCT = float(os.getenv("BT_MAX_TOTAL_RISK", "2.0"))
+MAX_HOLD_HOURS = int(os.getenv("BT_MAX_HOLD_HOURS", "48"))
+
+# Paramètres Donchian
+ENTRY_PERIOD = 20
+EXIT_PERIOD = 10
+EMA_FILTER = 200
+ATR_PERIOD = 20
+MIN_ATR_RATIO = 0.4
+SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
+
+# Sécurité
+LIVE_MODE = os.getenv("LIVE_MODE", "true").lower() == "true"
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "15.0"))
+
+# ============================================================
+# SÉCURITÉS DURES — NON CONTOURNABLES
+# ============================================================
+HARD_LIMITS = {
+    "max_volume_per_order": 1.0,       # jamais > 1 lot par ordre
+    "max_position_value_usd": 5000,    # jamais > 5000$ notional
+    "max_orders_per_hour": 3,          # max 3 ordres/heure
+    "max_orders_per_day": 6,           # max 6 ordres/jour
+    "min_free_margin_pct": 50,         # toujours 50%+ de marge libre
+}
+
+ORDER_LOG = deque(maxlen=50)  # {(timestamp, type)}
+BOT_STATE = {
+    "initial_equity": None,
+    "peak_equity": None,
+    "day_start_equity": None,
+    "current_day": None,
+    "halted": False,
+    "halt_reason": None,
+    "last_processed_bar": None,
+    "processed_bars": set(),
+    "first_equity_seen": None,
 }
 
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+def log(msg, level="INFO"):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    prefix = {"INFO": "ℹ️", "SIGNAL": "📊", "ORDER": "💼", "TRAIL": "📈",
+              "CLOSE": "🔚", "WARN": "⚠️", "ERROR": "🚨", "HALT": "🛑",
+              "SEC": "🔒"}.get(level, "•")
+    print(f"[{ts}] {prefix} [{level}] {msg}", flush=True)
 
 
-async def fetch_history(account, symbol, timeframe, years):
-    target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
-    rows, start, prev_oldest = [], None, None
-    while True:
-        try:
-            batch = await account.get_historical_candles(
-                symbol=symbol, timeframe=timeframe, start_time=start, limit=1000
-            )
-        except Exception as e:
-            log(f"[{symbol}] fetch error: {type(e).__name__}: {e}")
-            return None
-        if not batch:
-            break
-        batch = sorted(batch, key=lambda r: r["time"])
-        rows = batch + rows
-        oldest = batch[0]["time"]
-        if oldest.tzinfo is None:
-            oldest = oldest.replace(tzinfo=timezone.utc)
-        if len(rows) % 5000 < 1000:
-            log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 40000:
-            break
-        prev_oldest = oldest
-        start = oldest - timedelta(seconds=1)
-        await asyncio.sleep(0.2)
+# ============================================================
+# SÉCURITÉS
+# ============================================================
+def check_hard_limits(order_volume, notional_usd, account_info):
+    """Vérifie les 6 sécurités dures. Retourne (ok, raison)."""
+    now = datetime.now(timezone.utc)
 
-    if len(rows) < 3:
-        return None
-    df = pd.DataFrame([
-        {"time": r["time"], "open": r["open"], "high": r["high"],
-         "low": r["low"], "close": r["close"]}
-        for r in rows
-    ])
-    df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
-    for col in ("open", "high", "low", "close"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = (df.dropna(subset=["time", "open", "high", "low", "close"])
-            .sort_values("time").drop_duplicates("time").reset_index(drop=True))
-    return df.iloc[:-1].reset_index(drop=True)
+    # 1. Volume max
+    if order_volume > HARD_LIMITS["max_volume_per_order"]:
+        return False, f"volume {order_volume} > {HARD_LIMITS['max_volume_per_order']}"
+
+    # 2. Valeur notional max
+    if notional_usd > HARD_LIMITS["max_position_value_usd"]:
+        return False, f"notional {notional_usd:.0f}$ > {HARD_LIMITS['max_position_value_usd']}$"
+
+    # 3. Ordres par heure
+    hour_ago = now - timedelta(hours=1)
+    orders_last_hour = sum(1 for ts, _ in ORDER_LOG if ts > hour_ago)
+    if orders_last_hour >= HARD_LIMITS["max_orders_per_hour"]:
+        return False, f"{orders_last_hour} ordres dans l'heure >= {HARD_LIMITS['max_orders_per_hour']}"
+
+    # 4. Ordres par jour
+    day_ago = now - timedelta(hours=24)
+    orders_last_day = sum(1 for ts, _ in ORDER_LOG if ts > day_ago)
+    if orders_last_day >= HARD_LIMITS["max_orders_per_day"]:
+        return False, f"{orders_last_day} ordres dans la journée >= {HARD_LIMITS['max_orders_per_day']}"
+
+    # 5. Marge libre
+    equity = account_info.get("equity", 0)
+    margin_free = account_info.get("marginFree", equity)
+    if equity > 0:
+        free_pct = margin_free / equity * 100
+        if free_pct < HARD_LIMITS["min_free_margin_pct"]:
+            return False, f"marge libre {free_pct:.1f}% < {HARD_LIMITS['min_free_margin_pct']}%"
+
+    return True, "OK"
 
 
-def get_spread(symbol):
-    return SPREAD_OVERRIDES.get(symbol.upper(), 0.30)
+# ============================================================
+# INDICATEURS
+# ============================================================
+def compute_indicators(df):
+    h = df["high"].values.astype(float)
+    l = df["low"].values.astype(float)
+    c = df["close"].values.astype(float)
 
-
-def make_params(**over):
-    p = argparse.Namespace(
-        slippage=0.0, risk=RISK_PCT,
-        entry_period=20,
-        exit_period=10,
-        ema_filter=200,
-        use_ema_filter=True,
-        min_atr_ratio=0.4,
-        atr_period=20,
-        max_hold=48,
-        max_positions=2,
-        max_total_risk_pct=2.0,
-        max_spread_ratio=0.05,
-        capital=INITIAL_CAPITAL,
-        long_only=False, short_only=False,
-        gap_slip_sl=0.3, gap_slip_tp=0.3,
-        use_trailing=True,
-    )
-    for k, v in over.items():
-        setattr(p, k, v)
-    return p
-
-
-def run_donchian(df, p, symbol="SYM"):
-    """Version avec paramètres réduits si historique court (pour les mois)."""
-    d = df.reset_index(drop=True).copy()
-
-    # Réduction adaptative pour tenir dans 1 mois
-    ep = min(p.entry_period, max(5, len(d) // 30))
-    xp = min(p.exit_period, max(3, len(d) // 60))
-    ef = min(p.ema_filter, max(50, len(d) // 4))
-    ap = min(p.atr_period, max(5, len(d) // 20))
-
-    if len(d) < max(50, ep + 10):
-        return pd.DataFrame(), pd.Series(dtype=float), {}
-
-    o, h, l, c = (d[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
-    n = len(d)
     prev_close = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_close), np.abs(l - prev_close)])
-    atr = pd.Series(tr).rolling(ap, min_periods=ap).mean().to_numpy()
-    atr_avg = pd.Series(atr).rolling(min(50, n // 2), min_periods=5).mean().to_numpy()
-    ema_long = pd.Series(c).ewm(span=ef, adjust=False).mean().to_numpy()
+    atr = pd.Series(tr).rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().values
+    atr_avg = pd.Series(atr).rolling(100, min_periods=20).mean().values
+    ema_long = pd.Series(c).ewm(span=EMA_FILTER, adjust=False).mean().values
 
-    dc_hi_entry = pd.Series(h).rolling(ep).max().shift(1).to_numpy()
-    dc_lo_entry = pd.Series(l).rolling(ep).min().shift(1).to_numpy()
-    dc_hi_exit = pd.Series(h).rolling(xp).max().shift(1).to_numpy()
-    dc_lo_exit = pd.Series(l).rolling(xp).min().shift(1).to_numpy()
+    dc_hi_entry = pd.Series(h).rolling(ENTRY_PERIOD).max().shift(1).values
+    dc_lo_entry = pd.Series(l).rolling(ENTRY_PERIOD).min().shift(1).values
+    dc_hi_exit = pd.Series(h).rolling(EXIT_PERIOD).max().shift(1).values
+    dc_lo_exit = pd.Series(l).rolling(EXIT_PERIOD).min().shift(1).values
 
-    times = d["time"].to_numpy()
-    weekdays = d["time"].dt.weekday.to_numpy()
+    return {"atr": atr, "atr_avg": atr_avg, "ema_long": ema_long,
+            "dc_hi_entry": dc_hi_entry, "dc_lo_entry": dc_lo_entry,
+            "dc_hi_exit": dc_hi_exit, "dc_lo_exit": dc_lo_exit}
 
-    spread = get_spread(symbol)
-    half_spread = spread / 2.0
 
-    equity = float(p.capital)
-    positions, trades = [], []
-    info = {"signals_long": 0, "signals_short": 0}
+def check_signal(df, ind):
+    i = -1
+    if not np.isfinite(ind["atr"][i]) or not np.isfinite(ind["atr_avg"][i]):
+        return None
+    if not np.isfinite(ind["dc_hi_entry"][i]) or not np.isfinite(ind["dc_lo_entry"][i]):
+        return None
 
-    def close_position(pos, i, raw_fill, reason):
-        nonlocal equity
-        if pos not in positions:
+    A = ind["atr"][i]
+    if A < MIN_ATR_RATIO * ind["atr_avg"][i]:
+        return None
+
+    c = df["close"].values
+    close = c[i]
+    ema = ind["ema_long"][i]
+    ema_ok_long = close > ema
+    ema_ok_short = close < ema
+    bull_break = close > ind["dc_hi_entry"][i]
+    bear_break = close < ind["dc_lo_entry"][i]
+
+    if bull_break and ema_ok_long:
+        return {"dir": 1, "trigger": ind["dc_hi_entry"][i],
+                "sl": ind["dc_lo_exit"][i], "atr": A}
+    if bear_break and ema_ok_short:
+        return {"dir": -1, "trigger": ind["dc_lo_entry"][i],
+                "sl": ind["dc_hi_exit"][i], "atr": A}
+    return None
+
+
+# ============================================================
+# COMPTE
+# ============================================================
+async def get_account_info(account):
+    info = await account.get_information()
+    return {
+        "balance": info.get("balance", 0),
+        "equity": info.get("equity", 0),
+        "marginFree": info.get("marginFree", info.get("freeMargin", 0)),
+        "margin": info.get("margin", 0),
+    }
+
+
+async def get_positions(account):
+    try:
+        positions = await account.get_positions()
+        return [p for p in positions if p.get("symbol") == SYMBOL]
+    except Exception as e:
+        log(f"Erreur get_positions: {e}", "ERROR")
+        return []
+
+
+# ============================================================
+# EXÉCUTION
+# ============================================================
+async def open_position(account, signal, equity):
+    dist = abs(signal["trigger"] - signal["sl"])
+    if dist <= 0:
+        log(f"Distance SL invalide: {dist}", "WARN")
+        return None
+
+    risk_money = equity * RISK_PCT / 100.0
+    size = risk_money / dist
+
+    # Arrondi selon le symbole (XAUUSD = 2 décimales, 0.01 lot min)
+    size = round(size, 2)
+    if size < 0.01:
+        log(f"Taille trop petite ({size}), signal ignoré", "WARN")
+        return None
+
+    notional = size * signal["trigger"]
+
+    # ==== SÉCURITÉS DURES ====
+    acct = await get_account_info(account)
+    ok, reason = check_hard_limits(size, notional, acct)
+    if not ok:
+        log(f"🔒 ORDRE REFUSÉ par sécurité: {reason}", "SEC")
+        return None
+
+    # Logique d'exécution
+    if signal["dir"] == 1:
+        log(f"🔵 OUVERTURE LONG : {size} lots @ marché, SL={signal['sl']:.2f}, "
+            f"risque={risk_money:.2f}$ (notional={notional:.0f}$)", "ORDER")
+    else:
+        log(f"🔴 OUVERTURE SHORT : {size} lots @ marché, SL={signal['sl']:.2f}, "
+            f"risque={risk_money:.2f}$ (notional={notional:.0f}$)", "ORDER")
+
+    try:
+        if signal["dir"] == 1:
+            result = await account.create_market_buy_order(
+                symbol=SYMBOL, volume=size, stop_loss=signal["sl"]
+            )
+        else:
+            result = await account.create_market_sell_order(
+                symbol=SYMBOL, volume=size, stop_loss=signal["sl"]
+            )
+        order_id = result.get("orderId") if isinstance(result, dict) else str(result)
+        log(f"✅ Ordre exécuté : ID={order_id}", "ORDER")
+        ORDER_LOG.append((datetime.now(timezone.utc), signal["dir"]))
+        return order_id
+    except Exception as e:
+        log(f"❌ Échec ouverture : {type(e).__name__}: {e}", "ERROR")
+        return None
+
+
+async def update_stop_loss(account, position_id, new_sl):
+    try:
+        await account.modify_position(position_id=position_id, stop_loss=new_sl)
+        log(f"SL modifié : position {position_id} → {new_sl:.2f}", "TRAIL")
+        return True
+    except Exception as e:
+        log(f"Échec modif SL: {type(e).__name__}: {e}", "ERROR")
+        return False
+
+
+async def close_position(account, position_id, reason):
+    try:
+        await account.close_position(position_id=position_id)
+        log(f"Position fermée : {position_id} ({reason})", "CLOSE")
+        return True
+    except Exception as e:
+        log(f"Échec fermeture: {type(e).__name__}: {e}", "ERROR")
+        return False
+
+
+# ============================================================
+# BOUCLE
+# ============================================================
+async def fetch_candles(account):
+    try:
+        candles = await account.get_historical_candles(
+            symbol=SYMBOL, timeframe=TIMEFRAME, limit=300
+        )
+        if not candles:
+            return None
+        df = pd.DataFrame([
+            {"time": r["time"], "open": r["open"], "high": r["high"],
+             "low": r["low"], "close": r["close"]}
+            for r in candles
+        ])
+        df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
+        return df.sort_values("time").reset_index(drop=True)
+    except Exception as e:
+        log(f"Erreur fetch: {type(e).__name__}: {e}", "ERROR")
+        return None
+
+
+def is_new_bar(df):
+    if df is None or len(df) < 2:
+        return False
+    last_closed = df["time"].iloc[-2]
+    if last_closed not in BOT_STATE["processed_bars"]:
+        BOT_STATE["processed_bars"].add(last_closed)
+        if len(BOT_STATE["processed_bars"]) > 500:
+            BOT_STATE["processed_bars"] = set(list(BOT_STATE["processed_bars"])[-100:])
+        return True
+    return False
+
+
+async def process_bar(account, df):
+    ind = compute_indicators(df)
+    last_closed_time = df["time"].iloc[-2]
+    last_close = df["close"].iloc[-2]
+
+    # ==== 1. Gestion positions ====
+    positions = await get_positions(account)
+    for pos in positions:
+        pos_id = pos.get("id") or pos.get("positionId")
+        pos_type = str(pos.get("type", "")).lower()
+        dr = 1 if "buy" in pos_type or "long" in pos_type else -1
+        current_sl = float(pos.get("stopLoss", 0)) if pos.get("stopLoss") else None
+        open_time = pos.get("time")
+
+        # A. Trailing Donchian
+        new_sl = ind["dc_lo_exit"][-1] if dr == 1 else ind["dc_hi_exit"][-1]
+        if np.isfinite(new_sl):
+            if dr == 1 and (current_sl is None or new_sl > current_sl) and new_sl < last_close:
+                await update_stop_loss(account, pos_id, new_sl)
+            elif dr == -1 and (current_sl is None or new_sl < current_sl) and new_sl > last_close:
+                await update_stop_loss(account, pos_id, new_sl)
+
+        # B. Timeout
+        if open_time:
+            open_dt = pd.to_datetime(open_time, utc=True).tz_localize(None)
+            hours_held = (datetime.now(timezone.utc) - open_dt).total_seconds() / 3600
+            if hours_held >= MAX_HOLD_HOURS:
+                await close_position(account, pos_id, f"timeout {hours_held:.1f}h")
+
+    # ==== 2. Nouveau signal ====
+    positions = await get_positions(account)
+    if len(positions) >= MAX_POSITIONS:
+        return
+
+    signal = check_signal(df, ind)
+    if signal:
+        log(f"SIGNAL {'LONG' if signal['dir'] == 1 else 'SHORT'} "
+            f"à {last_closed_time} | trigger={signal['trigger']:.2f} | SL={signal['sl']:.2f}",
+            "SIGNAL")
+
+        if BOT_STATE["halted"]:
+            log(f"Bot en pause : {BOT_STATE['halt_reason']}", "HALT")
             return
-        positions.remove(pos)
-        dr = pos["dir"]
-        fill_raw = float(raw_fill)
-        if reason.startswith("trail"):
-            if dr == 1:
-                fill_raw = min(fill_raw, float(o[i]))
-            else:
-                fill_raw = max(fill_raw, float(o[i]))
-        fill = fill_raw - dr * half_spread
-        pnl = (fill - pos["entry"]) * dr * pos["size"]
-        equity += pnl
-        R = pnl / pos["risk_money"] if pos["risk_money"] else 0.0
-        trades.append({
-            "entry_time": pd.Timestamp(pos["entry_time"]),
-            "exit_time": pd.Timestamp(times[i]),
-            "dir": "LONG" if dr == 1 else "SHORT",
-            "entry": pos["entry"], "exit": fill,
-            "pnl": pnl, "R": R,
-            "bars": i - pos["entry_i"] + 1, "reason": reason,
-        })
 
-    for i in range(n):
-        for pos in list(positions):
-            if i <= pos["entry_i"]:
-                continue
-            dr = pos["dir"]
-            if p.use_trailing:
-                if dr == 1:
-                    new_stop = dc_lo_exit[i]
-                    if np.isfinite(new_stop) and new_stop > pos["stop"]:
-                        pos["stop"] = new_stop
-                else:
-                    new_stop = dc_hi_exit[i]
-                    if np.isfinite(new_stop) and new_stop < pos["stop"]:
-                        pos["stop"] = new_stop
-
-            if dr == 1:
-                if o[i] <= pos["stop"]:
-                    close_position(pos, i, min(pos["stop"], o[i]), "trail(gap)")
-                elif l[i] <= pos["stop"]:
-                    close_position(pos, i, pos["stop"], "trail")
-            else:
-                if o[i] >= pos["stop"]:
-                    close_position(pos, i, max(pos["stop"], o[i]), "trail(gap)")
-                elif h[i] >= pos["stop"]:
-                    close_position(pos, i, pos["stop"], "trail")
-
-            if pos in positions:
-                if i - pos["entry_i"] + 1 >= p.max_hold:
-                    close_position(pos, i, c[i], "temps")
-
-        in_session = weekdays[i] < 5
-        can_trade = (in_session and i >= ep + 5 and i > 0
-                     and np.isfinite(atr[i]) and np.isfinite(dc_hi_entry[i])
-                     and np.isfinite(dc_lo_entry[i])
-                     and len(positions) < p.max_positions)
-        if can_trade:
-            A = atr[i]
-            atr_ok = (not np.isfinite(atr_avg[i])) or (A >= p.min_atr_ratio * atr_avg[i])
-            if atr_ok:
-                ema_ok_long = (not p.use_ema_filter) or (c[i] > ema_long[i])
-                ema_ok_short = (not p.use_ema_filter) or (c[i] < ema_long[i])
-                bull_break = c[i] > dc_hi_entry[i]
-                bear_break = c[i] < dc_lo_entry[i]
-                candidates = []
-                if bull_break and ema_ok_long and not p.short_only:
-                    candidates.append((1, dc_hi_entry[i]))
-                if bear_break and ema_ok_short and not p.long_only:
-                    candidates.append((-1, dc_lo_entry[i]))
-                for dr, trigger_px in candidates:
-                    sl_px = dc_lo_exit[i] if dr == 1 else dc_hi_exit[i]
-                    if not np.isfinite(sl_px):
-                        continue
-                    entry = c[i] + dr * half_spread
-                    dist = abs(entry - sl_px)
-                    if dist <= 0:
-                        continue
-                    if spread > p.max_spread_ratio * dist:
-                        continue
-                    risk_money = max(equity, 0.0) * p.risk / 100.0
-                    if risk_money <= 0:
-                        continue
-                    positions.append({
-                        "dir": dr, "entry": entry,
-                        "stop": sl_px, "stop_initial": sl_px,
-                        "dist": dist, "size": risk_money / dist,
-                        "risk_money": risk_money,
-                        "entry_time": times[i], "entry_i": i,
-                    })
-                    if dr == 1:
-                        info["signals_long"] += 1
-                    else:
-                        info["signals_short"] += 1
-                    break
-
-    while positions:
-        close_position(positions[0], n - 1, c[-1], "fin")
-    return pd.DataFrame(trades), pd.Series(equity, index=[0]), info
+        acct = await get_account_info(account)
+        await open_position(account, signal, acct["equity"])
 
 
-def monthly_report(symbol, df):
-    p = make_params()
-    print("\n" + "#" * 70)
-    print(f"# BACKTEST MOIS PAR MOIS | {symbol} {TIMEFRAME} | {len(df)} bougies")
-    print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d}")
-    print(f"# DC20 / Exit10 / EMA200 / max_hold=48h")
-    print(f"# ⚠️ Ne trade qu'un mois isolé à la fois (pas de continuité de capital)")
-    print("#" * 70)
-
-    df = df.copy()
-    df["year"] = df["time"].dt.year
-    df["month"] = df["time"].dt.month
-
-    months = sorted(df.groupby(["year", "month"]).groups.keys())
-    results = []
-
-    print(f"\n{'Mois':>8} | {'Trades':>6} | {'Win%':>5} | {'Exp R':>7} | "
-          f"{'Ret%':>7} | {'PF':>5} | {'DD%':>6} | {'Durée':>7}")
-    print("-" * 80)
-
-    for (year, month) in months:
-        sub = df[(df["year"] == year) & (df["month"] == month)].reset_index(drop=True)
-        if len(sub) < 50:
-            continue
-        tr, _, info = run_donchian(sub, p, symbol=symbol)
-        if not len(tr):
-            print(f"{year}-{month:02d} | {0:>6} |     - |       - |       - |     - |      - |      -")
-            results.append({"year": year, "month": month, "n": 0, "exp": 0.0, "ret": 0.0,
-                            "pf": 0, "dd": 0, "win": 0, "bars": 0})
-            continue
-
-        # Calcul du rendement du mois (sur capital fixe 10000, pas compounding)
-        total_pnl = tr["pnl"].sum()
-        ret_pct = total_pnl / p.capital * 100.0
-        # Equity du mois pour DD
-        eq = p.capital + tr["pnl"].cumsum()
-        dd = ((eq / eq.cummax()) - 1.0).min() * 100.0
-        win = (tr["R"] > 0).mean() * 100.0
-        exp = tr["R"].mean()
-        gp = tr.loc[tr["R"] > 0, "R"].sum()
-        gl = -tr.loc[tr["R"] <= 0, "R"].sum()
-        pf = gp / gl if gl > 0 else float("inf")
-        bars = tr["bars"].mean()
-
-        print(f"{year}-{month:02d} | {len(tr):>6} | {win:>4.1f}% | {exp:>+7.3f} | "
-              f"{ret_pct:>+7.2f} | {pf:>5.2f} | {dd:>6.2f} | {bars:>6.1f}h")
-
-        results.append({"year": year, "month": month, "n": len(tr), "exp": exp,
-                        "ret": ret_pct, "pf": pf, "dd": dd, "win": win, "bars": bars})
-
-    # ============================================================
-    # SYNTHESE
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("SYNTHESE")
-    print("=" * 70)
-
-    r_df = pd.DataFrame(results)
-    active_months = r_df[r_df["n"] > 0]
-
-    print(f"Mois testés         : {len(r_df)}")
-    print(f"Mois avec trades    : {len(active_months)}")
-    print(f"Total trades        : {active_months['n'].sum()}")
-
-    if len(active_months) > 0:
-        win_months = (active_months["ret"] > 0).sum()
-        lose_months = (active_months["ret"] < 0).sum()
-        flat_months = (active_months["ret"] == 0).sum()
-
-        print(f"\nMois gagnants       : {win_months} ({win_months/len(active_months)*100:.1f}%)")
-        print(f"Mois perdants       : {lose_months} ({lose_months/len(active_months)*100:.1f}%)")
-        print(f"Mois plats          : {flat_months}")
-
-        print(f"\nMeilleur mois       : {active_months['ret'].max():+.2f} %")
-        print(f"Pire mois           : {active_months['ret'].min():+.2f} %")
-        print(f"Mois médian         : {active_months['ret'].median():+.2f} %")
-        print(f"Mois moyen          : {active_months['ret'].mean():+.2f} %")
-
-        print(f"\nEspérance moyenne   : {active_months['exp'].mean():+.3f} R")
-        print(f"Espérance médiane   : {active_months['exp'].median():+.3f} R")
-        print(f"Trades par mois moy : {active_months['n'].mean():.1f}")
-
-        print(f"\n--- DISTRIBUTION DES RENDEMENTS MENSUELS ---")
-        bins = [-100, -5, -3, -1, 0, 1, 3, 5, 100]
-        labels = ["< -5%", "-5/-3", "-3/-1", "-1/0", "0/+1", "+1/+3", "+3/+5", "> +5%"]
-        for i in range(len(bins) - 1):
-            count = ((active_months["ret"] >= bins[i]) &
-                     (active_months["ret"] < bins[i+1])).sum()
-            bar = "█" * count
-            print(f"  {labels[i]:>8} : {count:>3} {bar}")
-
-        # Conclusion
-        print(f"\n--- INTERPRETATION ---")
-        if win_months / len(active_months) > 0.5:
-            print(f"✅ {win_months/len(active_months)*100:.0f}% de mois gagnants → edge stable")
-        elif win_months / len(active_months) > 0.4:
-            print(f"⚠️ {win_months/len(active_months)*100:.0f}% de mois gagnants → acceptable pour trend following")
-        else:
-            print(f"❌ {win_months/len(active_months)*100:.0f}% de mois gagnants → edge fragile")
-
-        if active_months["ret"].mean() > 0:
-            print(f"✅ Rendement mensuel moyen positif (+{active_months['ret'].mean():.2f}%)")
-        else:
-            print(f"❌ Rendement mensuel moyen négatif ({active_months['ret'].mean():.2f}%)")
-
-        # Ratio de Sharpe simplifié
-        if active_months["ret"].std() > 0:
-            monthly_sharpe = active_months["ret"].mean() / active_months["ret"].std()
-            annual_sharpe = monthly_sharpe * np.sqrt(12)
-            print(f"\nSharpe mensuel      : {monthly_sharpe:.2f}")
-            print(f"Sharpe annualisé    : {annual_sharpe:.2f}")
-            if annual_sharpe > 1.0:
-                print("✅ Sharpe > 1.0 → stratégie exploitable")
-            elif annual_sharpe > 0.5:
-                print("⚠️ Sharpe 0.5-1.0 → acceptable avec prudence")
-            else:
-                print("❌ Sharpe < 0.5 → risque élevé pour le rendement")
-
-
+# ============================================================
+# SERVICES
+# ============================================================
 async def health_server():
     port = int(os.getenv("PORT", "10000"))
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS monthly backtest OK - no live orders"
+            body = f"ARKAS BOT OK | LIVE={LIVE_MODE} | {SYMBOL} {TIMEFRAME}".encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -387,29 +372,100 @@ async def keepalive():
             pass
 
 
+# ============================================================
+# MAIN
+# ============================================================
 async def main():
     if not TOKEN or not ACCOUNT_ID:
         raise RuntimeError("METAAPI_TOKEN et METAAPI_ACCOUNT_ID requis.")
+
+    log("=" * 65)
+    log("ARKAS DONCHIAN LIVE BOT")
+    log(f"Symbole   : {SYMBOL} {TIMEFRAME}")
+    log(f"Mode      : {'🔴 LIVE — ordres réels démo' if LIVE_MODE else '🟢 DRY-RUN'}")
+    log(f"Risque    : {RISK_PCT}% par trade | max {MAX_POSITIONS} positions")
+    log(f"Limites   : DD {MAX_DRAWDOWN_PCT}% | pertes jour {MAX_DAILY_LOSS_PCT}%")
+    log(f"🔒 SÉCURITÉS DURES :")
+    log(f"   • Volume max       : {HARD_LIMITS['max_volume_per_order']} lots")
+    log(f"   • Notional max     : {HARD_LIMITS['max_position_value_usd']}$")
+    log(f"   • Ordres max/heure : {HARD_LIMITS['max_orders_per_hour']}")
+    log(f"   • Ordres max/jour  : {HARD_LIMITS['max_orders_per_day']}")
+    log(f"   • Marge libre min  : {HARD_LIMITS['min_free_margin_pct']}%")
+    log("=" * 65)
+
     server_task = asyncio.create_task(health_server())
     keepalive_task = asyncio.create_task(keepalive())
+
     api = MetaApi(TOKEN, {"region": REGION})
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s)")
-    try:
-        df = await fetch_history(account, SYMBOL, TIMEFRAME, YEARS)
-        if df is None or len(df) == 0:
-            print(f"[{SYMBOL}] Aucune bougie reçue.", flush=True)
-        else:
-            monthly_report(SYMBOL, df)
-    except Exception as exc:
-        log(f"Erreur: {type(exc).__name__}: {exc}")
-    finally:
-        keepalive_task.cancel()
-        print("\nTERMINÉ. Aucun ordre n'a été passé.", flush=True)
-        await server_task
+    log("✅ Compte MetaApi connecté")
+
+    info = await get_account_info(account)
+    log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f} | "
+        f"Marge libre : {info['marginFree']:.2f}")
+    BOT_STATE["initial_equity"] = info["equity"]
+    BOT_STATE["peak_equity"] = info["equity"]
+    BOT_STATE["day_start_equity"] = info["equity"]
+    BOT_STATE["first_equity_seen"] = info["equity"]
+
+    log(f"📡 Surveillance {SYMBOL} {TIMEFRAME} démarrée")
+    log("Boucle : vérification toutes les 60 secondes")
+    log("")
+
+    while True:
+        try:
+            await asyncio.sleep(60)
+
+            # Reset journalier
+            today = datetime.now(timezone.utc).date()
+            if BOT_STATE["current_day"] != today:
+                BOT_STATE["current_day"] = today
+                info = await get_account_info(account)
+                BOT_STATE["day_start_equity"] = info["equity"]
+                log(f"🌅 Nouveau jour. Equity début : {info['equity']:.2f}")
+
+            # Vérif limites
+            info = await get_account_info(account)
+            current_equity = info["equity"]
+            if current_equity > BOT_STATE["peak_equity"]:
+                BOT_STATE["peak_equity"] = current_equity
+
+            dd_pct = (current_equity - BOT_STATE["peak_equity"]) / BOT_STATE["peak_equity"] * 100
+            if dd_pct < -MAX_DRAWDOWN_PCT and not BOT_STATE["halted"]:
+                BOT_STATE["halted"] = True
+                BOT_STATE["halt_reason"] = f"DD {dd_pct:.2f}% > {MAX_DRAWDOWN_PCT}%"
+                log(f"🛑 ARRÊT : {BOT_STATE['halt_reason']}", "HALT")
+
+            day_pnl_pct = (current_equity - BOT_STATE["day_start_equity"]) / BOT_STATE["day_start_equity"] * 100
+            if day_pnl_pct < -MAX_DAILY_LOSS_PCT and not BOT_STATE["halted"]:
+                BOT_STATE["halted"] = True
+                BOT_STATE["halt_reason"] = f"Perte jour {day_pnl_pct:.2f}%"
+                log(f"🛑 ARRÊT jour : {BOT_STATE['halt_reason']}", "HALT")
+
+            if BOT_STATE["halted"]:
+                continue
+
+            df = await fetch_candles(account)
+            if df is None:
+                continue
+
+            if is_new_bar(df):
+                last_bar = df["time"].iloc[-2]
+                log(f"📊 Nouvelle bougie : {last_bar}")
+                await process_bar(account, df)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log(f"Erreur boucle: {type(e).__name__}: {e}", "ERROR")
+            await asyncio.sleep(30)
+
+    keepalive_task.cancel()
+    log("Bot arrêté.")
+    await server_task
 
 
 if __name__ == "__main__":
