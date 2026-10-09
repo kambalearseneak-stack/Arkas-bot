@@ -1,19 +1,24 @@
 """
 Backtest SCALP XAUUSD (M5) 100 % MetaApi — rapport dans les logs, AUCUN ordre passé.
-Stratégie : SMC / Price Action
+
+Stratégie : SMC V4 — Retournement sur Order Block en zone Fibonacci 0.5-1.0
   - Biais : structure H1 (dernier swing high/low cassé)
-  - M5 : détection swing highs/lows + liquidité (equal highs/lows)
-  - Signal : balayage de liquidité + BOS + retour dans l'Order Block
-  - Entrée à l'ouverture suivante ; SL derrière le swing balayé + 0.1 ATR, borné [0.8 ; 2.0] ATR
-  - TP = 1.5 x risque ; sortie forcée 24 bougies ou fin de session
-  - Filtres : session liquide, spread <= 15 % du stop
-  - Garde-fous : stop du jour après 2 pertes d'affilée, ou -2 %/jour
+  - Leg identifié sur M5, retracement en zone discount (long) / premium (short)
+  - Entrée : OB haussier/baissier non mitigé + balayage + FVG + rejet
+  - SL derrière le leg + 0.1 ATR, borné [0.8 ; 2.0] ATR
+  - TP = RR x risque ; sortie forcée 24 bougies / fin de session
+
+Garde-fous journaliers (% calculés sur le CAPITAL INITIAL, pas sur l'equity courante) :
+  - Objectif : +20 % du capital initial -> arrêt de la journée
+  - Limite   : -15 % du capital initial -> arrêt de la journée
+  - Stop secondaire : 2 pertes consécutives
 
 Env (en plus de METAAPI_TOKEN / METAAPI_ACCOUNT_ID / METAAPI_REGION) :
   BT_SYMBOL   (défaut XAUUSD)
   BT_YEARS    (défaut 0.75)
-  BT_SESSION  (défaut "9,18", heure broker)
+  BT_SESSION  (défaut "8,16" : heures broker)
   BT_SPREAD   (défaut 0.30)
+  BT_RISK     (défaut 1.0 : % du capital initial risqué par trade)
 """
 import argparse
 import asyncio
@@ -31,9 +36,18 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
 SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
 YEARS = float(os.getenv("BT_YEARS", "0.75"))
-SESSION = tuple(int(x) for x in os.getenv("BT_SESSION", "9,18").split(","))
+SESSION = tuple(int(x) for x in os.getenv("BT_SESSION", "8,16").split(","))
 SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
+RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
 TIMEFRAME = "5m"
+
+# ------------------------------------------------------------------------------
+# Objectifs journaliers (en % du CAPITAL INITIAL, fixe)
+# ------------------------------------------------------------------------------
+DAILY_TARGET_PCT = 20.0    # +20 % du capital initial -> arrêt
+DAILY_LOSS_PCT = 15.0      # -15 % du capital initial -> arrêt
+MAX_CONSEC_LOSSES = 2      # garde-fou secondaire
+INITIAL_CAPITAL = 10000.0  # référence fixe pour tous les calculs journaliers
 
 
 def log(msg):
@@ -72,10 +86,9 @@ async def fetch_history(account, symbol, timeframe, years):
 
 
 # ------------------------------------------------------------------------------
-# SMC : structure & swings
+# Helpers SMC
 # ------------------------------------------------------------------------------
 def find_swings(h, l, left=2, right=2):
-    """Swing high/low : plus haut/bas strict sur [i-left ; i+right]."""
     n = len(h)
     sh = np.zeros(n, dtype=bool)
     sl = np.zeros(n, dtype=bool)
@@ -89,52 +102,75 @@ def find_swings(h, l, left=2, right=2):
     return sh, sl
 
 
-def h1_bias_series(df, left=2, right=2, lookback=40):
-    """
-    Biais H1 : dernier swing high/low cassé.
-    +1 si le dernier BOS est haussier, -1 sinon, 0 si indéterminé.
-    Décalé d'1 h (connu seulement en fin de bougie H1).
-    """
-    s = df.set_index("time")[["high", "low", "close"]].resample("1h").agg(
-        {"high": "max", "low": "min", "close": "last"}).dropna()
-    if len(s) < lookback:
-        return np.zeros(len(df))
-    H = s["high"].values
-    L = s["low"].values
-    sh, sl = find_swings(H, L, left, right)
-    bias = np.zeros(len(s))
-    last_sh = np.nan
-    last_sl = np.nan
-    state = 0
-    for i in range(len(s)):
-        if sh[i]:
-            last_sh = H[i]
-        if sl[i]:
-            last_sl = L[i]
-        c = s["close"].values[i]
-        if not np.isnan(last_sh) and c > last_sh and state != 1:
-            state = 1
-            last_sh = np.nan
-        elif not np.isnan(last_sl) and c < last_sl and state != -1:
-            state = -1
-            last_sl = np.nan
-        bias[i] = state
-    ser = pd.Series(bias, index=s.index + pd.Timedelta(hours=1))
-    return ser.reindex(pd.DatetimeIndex(df["time"]), method="ffill").fillna(0).values
+def find_leg(h, l, sh, sl, i, direction, lookback=40):
+    lo0 = max(0, i - lookback)
+    highs = [j for j in range(lo0, i) if sh[j]]
+    lows = [j for j in range(lo0, i) if sl[j]]
+    if not highs or not lows:
+        return None
+    if direction == -1:
+        hi_idx = highs[-1]
+        lows_before = [j for j in lows if j < hi_idx]
+        if not lows_before:
+            return None
+        lo_idx = lows_before[-1]
+        if hi_idx <= lo_idx:
+            return None
+        return lo_idx, hi_idx
+    else:
+        lo_idx = lows[-1]
+        highs_before = [j for j in highs if j < lo_idx]
+        if not highs_before:
+            return None
+        hi_idx = highs_before[-1]
+        if hi_idx <= lo_idx:
+            return None
+        return lo_idx, hi_idx
+
+
+def fib_zone(leg_lo, leg_hi, direction, f_lo=0.5, f_hi=1.0):
+    rng = leg_hi - leg_lo
+    if direction == 1:
+        z_hi = leg_hi - f_lo * rng
+        z_lo = leg_hi - f_hi * rng
+        return z_lo, z_hi
+    else:
+        z_lo = leg_lo + f_lo * rng
+        z_hi = leg_lo + f_hi * rng
+        return z_lo, z_hi
+
+
+def has_fvg(h, l, i, direction, lookback=5):
+    for k in range(max(2, i - lookback), i + 1):
+        if direction == 1 and l[k - 2] > h[k]:
+            return True
+        if direction == -1 and h[k - 2] < l[k]:
+            return True
+    return False
+
+
+def in_killzone(hours, weekday):
+    if weekday >= 5:
+        return False
+    return ((hours >= 8) & (hours < 11)) | ((hours >= 13) & (hours < 16))
 
 
 def make_params(**over):
     p = argparse.Namespace(
-        spread=SPREAD, slippage=0.05, risk=0.25, rr=1.5, atr=14,
-        swing_left=2, swing_right=2,          # détection des swings M5
-        lookback_liq=30,                      # fenêtre de recherche de liquidité (bougies)
-        eq_tol_atr=0.15,                      # tolérance equal highs/lows (en ATR)
-        ob_lookback=20,                       # profondeur max pour trouver l'Order Block
+        spread=SPREAD, slippage=0.05, risk=RISK_PCT, rr=2.0, atr=14,
+        swing_left=2, swing_right=2,
+        leg_lookback=40,
+        fib_lo=0.5, fib_hi=1.0,
+        ob_lookback=15,
+        eq_tol_atr=0.15,
+        require_fvg=True,
         sl_min_atr=0.8, sl_max_atr=2.0,
         max_spread_ratio=0.15, max_hold=24,
-        max_consec=2, daily_loss=2.0,
-        sess_start=SESSION[0], sess_end=SESSION[1], capital=10000.0,
-        long_only=False,
+        max_consec=MAX_CONSEC_LOSSES,
+        daily_target=DAILY_TARGET_PCT,
+        daily_loss=DAILY_LOSS_PCT,
+        sess_start=SESSION[0], sess_end=SESSION[1],
+        capital=INITIAL_CAPITAL, long_only=False,
     )
     for k, v in over.items():
         setattr(p, k, v)
@@ -148,10 +184,10 @@ def run_scalp(df, p, start_idx=0):
     pc = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - pc), np.abs(l - pc)])
     atr = pd.Series(tr).rolling(p.atr).mean().values
-    bias = h1_bias_series(d, p.swing_left, p.swing_right)
     sh, sl = find_swings(h, l, p.swing_left, p.swing_right)
     hours = d["time"].dt.hour.values
-    in_sess = (hours >= p.sess_start) & (hours < p.sess_end) & (d["time"].dt.weekday.values < 5)
+    weekday = d["time"].dt.weekday.values
+    in_sess = in_killzone(hours, weekday)
     days = d["time"].dt.normalize().values
     t = d["time"].values
 
@@ -160,12 +196,24 @@ def run_scalp(df, p, start_idx=0):
     pos, pending = None, None
     trades = []
     curve = np.full(n, np.nan)
-    cur_day, day_start, halted, consec = None, equity, False, 0
-    info = {"signals": 0, "skipped_spread": 0,
-            "longs": 0, "shorts": 0, "bos": 0, "sweeps": 0}
+    daily_pnl = []
+
+    # -------------------------------------------------------------------
+    # État journalier — le % est TOUJOURS calculé sur initial_capital (fixe)
+    # -------------------------------------------------------------------
+    initial_capital = p.capital          # référence FIXE, jamais modifiée
+    cur_day = None
+    day_open_equity = equity             # equity en début de journée (pour stats)
+    day_halted = False
+    day_halt_reason = None
+    consec = 0
+
+    info = {"signals": 0, "skipped_spread": 0, "longs": 0, "shorts": 0,
+            "rejected_fib": 0, "rejected_fvg": 0, "rejected_ob_mit": 0,
+            "days_target_hit": 0, "days_loss_hit": 0, "days_consec_hit": 0}
 
     def close_trade(i, raw, reason):
-        nonlocal equity, pos, consec, halted
+        nonlocal equity, pos, consec, day_halted, day_halt_reason
         dr = pos["dir"]
         fill = raw - dr * (half + p.slippage)
         pnl = (fill - pos["entry"]) * dr * pos["size"]
@@ -176,18 +224,43 @@ def run_scalp(df, p, start_idx=0):
                        "cost_R": (p.spread + 2 * p.slippage) / pos["dist"],
                        "bars": i - pos["entry_i"] + 1, "reason": reason})
         consec = consec + 1 if pnl <= 0 else 0
-        if consec >= p.max_consec or (equity - day_start) / day_start * 100 <= -p.daily_loss:
-            halted = True
+
+        # Seuils journaliers : % du CAPITAL INITIAL (fixe)
+        day_ret_on_initial = (equity - day_open_equity) / initial_capital * 100.0
+        if day_ret_on_initial >= p.daily_target and not day_halted:
+            day_halted = True
+            day_halt_reason = "objectif +%.1f%% du capital initial atteint" % p.daily_target
+            info["days_target_hit"] += 1
+        elif day_ret_on_initial <= -p.daily_loss and not day_halted:
+            day_halted = True
+            day_halt_reason = "limite -%.1f%% du capital initial atteinte" % p.daily_loss
+            info["days_loss_hit"] += 1
+        elif consec >= p.max_consec and not day_halted:
+            day_halted = True
+            day_halt_reason = "%d pertes consécutives" % p.max_consec
+            info["days_consec_hit"] += 1
         pos = None
 
     for i in range(n):
+        # Nouveau jour -> reset
         if days[i] != cur_day:
-            cur_day, day_start, halted, consec = days[i], equity, False, 0
+            if cur_day is not None:
+                daily_pnl.append({
+                    "date": cur_day,
+                    "ret_pct_on_initial": (equity - day_open_equity) / initial_capital * 100.0,
+                    "ret_pct_on_dayopen": (equity - day_open_equity) / day_open_equity * 100.0,
+                    "halt_reason": day_halt_reason,
+                })
+            cur_day = days[i]
+            day_open_equity = equity
+            day_halted = False
+            day_halt_reason = None
+            consec = 0
 
         # 1) entrée à l'ouverture
         if pending is not None and pos is None:
             dr, dist = pending
-            if in_sess[i] and not halted and equity > 0:
+            if in_sess[i] and not day_halted and equity > 0:
                 entry = o[i] + dr * (half + p.slippage)
                 risk_money = equity * p.risk / 100.0
                 pos = {"dir": dr, "entry": entry, "stop": entry - dr * dist,
@@ -196,7 +269,7 @@ def run_scalp(df, p, start_idx=0):
                        "entry_time": t[i], "entry_i": i}
         pending = None
 
-        # 2) gestion : SL avant TP (prudent)
+        # 2) gestion du trade en cours
         if pos is not None:
             if pos["dir"] == 1:
                 if o[i] <= pos["stop"]:
@@ -222,68 +295,76 @@ def run_scalp(df, p, start_idx=0):
                 elif i + 1 >= n or not in_sess[i + 1]:
                     close_trade(i, c[i], "fin de session")
 
-        # 3) signal SMC à la clôture de la bougie i
-        if (pos is None and i >= start_idx and in_sess[i] and not halted
+        # 3) signal
+        if (pos is None and i >= start_idx and in_sess[i] and not day_halted
                 and i + 1 < n and in_sess[i + 1]
-                and not np.isnan(atr[i]) and bias[i] != 0):
+                and not np.isnan(atr[i])):
             A = atr[i]
             dr = 0
             raw = 0.0
 
-            # ---- LONG : sweep de liquidité basse + retour dans l'OB haussier
-            if bias[i] == 1:
-                # 3a. Liquidité basse récente (swing low / equal lows) sur la fenêtre
-                lo0 = max(0, i - p.lookback_liq)
-                lows_idx = [j for j in range(lo0, i) if sl[j]]
-                if lows_idx:
-                    liq = min(l[lows_idx])
-                    # equal lows
-                    for j in lows_idx:
-                        if abs(l[j] - liq) <= p.eq_tol_atr * A and j != lows_idx[0]:
-                            liq = min(liq, l[j])
-                    swept = l[i] < liq  # mèche sous la liquidité
-                    rej = c[i] > liq and c[i] > o[i]  # rejet haussier
-                    if swept and rej:
-                        info["sweeps"] += 1
-                        # 3b. Order Block : dernière bougie baissière avant la cassure haussière
-                        ob_hi = ob_lo = None
-                        hi_break = max(h[lo0:i + 1])
-                        for k in range(i, max(lo0, i - p.ob_lookback) - 1, -1):
-                            if c[k] < o[k]:
-                                ob_hi, ob_lo = h[k], l[k]
-                                break
-                        # 3c. Retour dans l'OB / la zone de sweep
-                        zone_lo = min(ob_lo if ob_lo is not None else liq, liq)
-                        zone_hi = max(ob_hi if ob_hi is not None else liq, liq)
-                        if l[i] <= zone_hi and c[i] >= zone_lo:
+            # LONG
+            leg = find_leg(h, l, sh, sl, i, direction=-1, lookback=p.leg_lookback)
+            if leg is not None:
+                leg_lo, leg_hi = leg[0], leg[1]
+                z_lo, z_hi = fib_zone(l[leg_lo], h[leg_hi], direction=1,
+                                      f_lo=p.fib_lo, f_hi=p.fib_hi)
+                price_in_zone = (z_lo - p.eq_tol_atr * A) <= c[i] <= (z_hi + p.eq_tol_atr * A)
+                if not price_in_zone:
+                    info["rejected_fib"] += 1
+                else:
+                    lo0 = max(0, i - p.leg_lookback)
+                    ob_hi = ob_lo = ob_idx = None
+                    for k in range(i, max(lo0, i - p.ob_lookback) - 1, -1):
+                        if c[k] < o[k]:
+                            ob_hi, ob_lo, ob_idx = h[k], l[k], k
+                            break
+                    if ob_idx is None:
+                        info["rejected_ob_mit"] += 1
+                    else:
+                        ob_in_zone = (ob_lo >= z_lo - p.eq_tol_atr * A) and (ob_hi <= z_hi + p.eq_tol_atr * A)
+                        touches = sum(1 for k in range(ob_idx + 1, i)
+                                      if l[k] <= ob_hi and h[k] >= ob_lo)
+                        swept = l[i] < l[leg_lo]
+                        rej = c[i] > o[i] and c[i] > l[leg_lo]
+                        fvg_ok = (not p.require_fvg) or has_fvg(h, l, i, 1)
+                        if not fvg_ok:
+                            info["rejected_fvg"] += 1
+                        elif ob_in_zone and touches <= 1 and swept and rej:
                             dr = 1
                             raw = c[i] - l[i]
-                            info["bos"] += 1
 
-            # ---- SHORT : sweep de liquidité haute + retour dans l'OB baissier
-            elif (not p.long_only) and bias[i] == -1:
-                lo0 = max(0, i - p.lookback_liq)
-                highs_idx = [j for j in range(lo0, i) if sh[j]]
-                if highs_idx:
-                    liq = max(h[highs_idx])
-                    for j in highs_idx:
-                        if abs(h[j] - liq) <= p.eq_tol_atr * A and j != highs_idx[0]:
-                            liq = max(liq, h[j])
-                    swept = h[i] > liq
-                    rej = c[i] < liq and c[i] < o[i]
-                    if swept and rej:
-                        info["sweeps"] += 1
-                        ob_hi = ob_lo = None
+            # SHORT
+            if dr == 0 and not p.long_only:
+                leg = find_leg(h, l, sh, sl, i, direction=+1, lookback=p.leg_lookback)
+                if leg is not None:
+                    leg_lo, leg_hi = leg[0], leg[1]
+                    z_lo, z_hi = fib_zone(l[leg_lo], h[leg_hi], direction=-1,
+                                          f_lo=p.fib_lo, f_hi=p.fib_hi)
+                    price_in_zone = (z_lo - p.eq_tol_atr * A) <= c[i] <= (z_hi + p.eq_tol_atr * A)
+                    if not price_in_zone:
+                        info["rejected_fib"] += 1
+                    else:
+                        lo0 = max(0, i - p.leg_lookback)
+                        ob_hi = ob_lo = ob_idx = None
                         for k in range(i, max(lo0, i - p.ob_lookback) - 1, -1):
                             if c[k] > o[k]:
-                                ob_hi, ob_lo = h[k], l[k]
+                                ob_hi, ob_lo, ob_idx = h[k], l[k], k
                                 break
-                        zone_lo = min(ob_lo if ob_lo is not None else liq, liq)
-                        zone_hi = max(ob_hi if ob_hi is not None else liq, liq)
-                        if h[i] >= zone_lo and c[i] <= zone_hi:
-                            dr = -1
-                            raw = h[i] - c[i]
-                            info["bos"] += 1
+                        if ob_idx is None:
+                            info["rejected_ob_mit"] += 1
+                        else:
+                            ob_in_zone = (ob_lo >= z_lo - p.eq_tol_atr * A) and (ob_hi <= z_hi + p.eq_tol_atr * A)
+                            touches = sum(1 for k in range(ob_idx + 1, i)
+                                          if l[k] <= ob_hi and h[k] >= ob_lo)
+                            swept = h[i] > h[leg_hi]
+                            rej = c[i] < o[i] and c[i] < h[leg_hi]
+                            fvg_ok = (not p.require_fvg) or has_fvg(h, l, i, -1)
+                            if not fvg_ok:
+                                info["rejected_fvg"] += 1
+                            elif ob_in_zone and touches <= 1 and swept and rej:
+                                dr = -1
+                                raw = h[i] - c[i]
 
             if dr:
                 dist = min(max(raw + 0.1 * A, p.sl_min_atr * A), p.sl_max_atr * A)
@@ -302,11 +383,18 @@ def run_scalp(df, p, start_idx=0):
     if pos is not None:
         close_trade(n - 1, c[-1], "fin des données")
         curve[-1] = equity
-    return pd.DataFrame(trades), pd.Series(curve, index=d["time"]).ffill(), info
+    if cur_day is not None:
+        daily_pnl.append({
+            "date": cur_day,
+            "ret_pct_on_initial": (equity - day_open_equity) / initial_capital * 100.0,
+            "ret_pct_on_dayopen": (equity - day_open_equity) / day_open_equity * 100.0,
+            "halt_reason": day_halt_reason,
+        })
+    return pd.DataFrame(trades), pd.Series(curve, index=d["time"]).ffill(), info, pd.DataFrame(daily_pnl)
 
 
 # ------------------------------------------------------------------------------
-# Métriques et rapport
+# Métriques & rapport
 # ------------------------------------------------------------------------------
 def metrics(trades, curve, capital, start_time=None):
     if start_time is not None:
@@ -336,7 +424,7 @@ def metrics(trades, curve, capital, start_time=None):
     return m
 
 
-def show(title, m, info, bh=None):
+def show(title, m, info, daily, bh=None):
     print(f"\n=== {title} ===", flush=True)
     if not m.get("n"):
         print("Aucun trade.", flush=True)
@@ -345,6 +433,9 @@ def show(title, m, info, bh=None):
     print(f"Trades            : {m['n']} ({m['n'] / m['days']:.2f}/jour)", flush=True)
     print(f"  dont longs/shorts : {info.get('longs', 0)}/{info.get('shorts', 0)}", flush=True)
     print(f"Signaux rejetés   : {info['skipped_spread']}/{info['signals']} (spread)", flush=True)
+    print(f"Rejets fib 0.5-1.0: {info.get('rejected_fib', 0)}", flush=True)
+    print(f"Rejets FVG        : {info.get('rejected_fvg', 0)}", flush=True)
+    print(f"Rejets OB absent/mitigé: {info.get('rejected_ob_mit', 0)}", flush=True)
     print(f"Réussite          : {m['win']:.1f} %", flush=True)
     print(f"Espérance NETTE   : {m['exp']:+.3f} R/trade", flush=True)
     print(f"Avant coûts       : {m['exp_gross']:+.3f} R/trade", flush=True)
@@ -358,57 +449,92 @@ def show(title, m, info, bh=None):
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %", flush=True)
 
+    # === STATS JOURNALIÈRES (sur CAPITAL INITIAL) ===
+    if daily is not None and len(daily):
+        d = daily.copy()
+        d["ret_pct_on_initial"] = d["ret_pct_on_initial"].fillna(0.0)
+        win_days = (d["ret_pct_on_initial"] > 0).sum()
+        loss_days = (d["ret_pct_on_initial"] < 0).sum()
+        flat_days = (d["ret_pct_on_initial"] == 0).sum()
+        print("\n--- STATS JOURNALIÈRES (% sur CAPITAL INITIAL) ---", flush=True)
+        print(f"Jours tradés      : {len(d)}", flush=True)
+        print(f"  gagnants        : {win_days} ({win_days/len(d)*100:.1f}%)", flush=True)
+        print(f"  perdants        : {loss_days} ({loss_days/len(d)*100:.1f}%)", flush=True)
+        print(f"  plats           : {flat_days}", flush=True)
+        print(f"Meilleur jour     : {d['ret_pct_on_initial'].max():+.2f} % du capital initial", flush=True)
+        print(f"Pire jour         : {d['ret_pct_on_initial'].min():+.2f} % du capital initial", flush=True)
+        print(f"Jour moyen        : {d['ret_pct_on_initial'].mean():+.3f} % du capital initial", flush=True)
+        print(f"Jours atteignant +{DAILY_TARGET_PCT}% : {info.get('days_target_hit', 0)}", flush=True)
+        print(f"Jours atteignant -{DAILY_LOSS_PCT}% : {info.get('days_loss_hit', 0)}", flush=True)
+        print(f"Jours arrêtés (consec) : {info.get('days_consec_hit', 0)}", flush=True)
+
 
 def report(symbol, df, oos=0.3):
     p = make_params()
     print("\n" + "#" * 44, flush=True)
-    print(f"# SMC SCALP {symbol} M5 | {len(df)} bougies", flush=True)
+    print(f"# SMC V4 RETOURNEMENT {symbol} M5 | {len(df)} bougies", flush=True)
     print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}", flush=True)
-    print(f"# Dernière bougie (heure broker) : {df['time'].iloc[-1]:%H:%M}", flush=True)
-    print(f"# Session {p.sess_start}h-{p.sess_end}h | spread {p.spread} | risque {p.risk}%", flush=True)
+    print(f"# Objectif : +{p.daily_target}%/jour max | Perte max : -{p.daily_loss}%/jour", flush=True)
+    print(f"# (calculés sur CAPITAL INITIAL {p.capital:.0f})", flush=True)
+    print(f"# Risque/trade : {p.risk}% | RR : {p.rr} | Session : {p.sess_start}-{p.sess_end}h broker", flush=True)
     print("#" * 44, flush=True)
     if len(df) < 5000:
-        print("Historique insuffisant (< 5000 bougies) pour conclure.", flush=True)
+        print("Historique insuffisant (< 5000 bougies).", flush=True)
         return
 
     split = int(len(df) * (1 - oos))
     split_time = df["time"].iloc[split]
-    tr, cv, inf = run_scalp(df.iloc[:split], p)
+
+    tr, cv, inf, dl = run_scalp(df.iloc[:split], p)
     bh = (df["close"].iloc[split - 1] / df["close"].iloc[0] - 1) * 100
-    show("ECHANTILLON (70 %)", metrics(tr, cv, p.capital), inf, bh)
-    tr, cv, inf = run_scalp(df, p, start_idx=split)
+    show("ECHANTILLON (70 %)", metrics(tr, cv, p.capital), inf, dl, bh)
+
+    tr, cv, inf, dl = run_scalp(df, p, start_idx=split)
     bh = (df["close"].iloc[-1] / df["close"].iloc[split] - 1) * 100
-    show("HORS-ECHANTILLON (30 %)", metrics(tr, cv, p.capital, split_time), inf, bh)
+    show("HORS-ECHANTILLON (30 %)", metrics(tr, cv, p.capital, split_time), inf, dl, bh)
 
     print("\n=== SENSIBILITE AU SPREAD (net R | rend. | DD | n) ===", flush=True)
     for sp in (0.15, 0.30, 0.50, 0.80):
-        tr, cv, _ = run_scalp(df, make_params(spread=sp))
+        tr, cv, _, _ = run_scalp(df, make_params(spread=sp))
         m = metrics(tr, cv, p.capital)
         line = (f"{m['exp']:+.2f}R {m['ret']:+.1f}% {m['dd']:.0f}% n={m['n']}"
                 if m.get("n") else "aucun trade")
         print(f"spread {sp:.2f} : {line}", flush=True)
 
-    print("\n=== ROBUSTESSE : RR x lookback liquidité (net R | rend. | n) ===", flush=True)
-    for rr in (1.0, 1.5, 2.0):
-        for lb in (20, 30, 50):
-            tr, cv, _ = run_scalp(df, make_params(rr=rr, lookback_liq=lb))
-            m = metrics(tr, cv, p.capital)
-            line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-            print(f"RR {rr} LB{lb} : {line}", flush=True)
-
-    print("\n=== ROBUSTESSE : swing_left/right (net R | rend. | n) ===", flush=True)
-    for slw in (1, 2, 3):
-        tr, cv, _ = run_scalp(df, make_params(swing_left=slw, swing_right=slw))
+    print("\n=== ROBUSTESSE : zone Fibonacci (net R | rend. | n) ===", flush=True)
+    for f_lo, f_hi in ((0.382, 0.618), (0.5, 0.618), (0.5, 0.79), (0.5, 1.0), (0.618, 1.0)):
+        tr, cv, _, _ = run_scalp(df, make_params(fib_lo=f_lo, fib_hi=f_hi))
         m = metrics(tr, cv, p.capital)
         line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-        print(f"swing {slw} : {line}", flush=True)
+        print(f"Fib {f_lo}-{f_hi} : {line}", flush=True)
 
-    print("\nLecture : l'espérance NETTE doit rester > 0 sur l'échantillon, "
-          "le hors-échantillon ET quand le spread monte.", flush=True)
+    print("\n=== ROBUSTESSE : RR (net R | rend. | n) ===", flush=True)
+    for rr in (1.0, 1.5, 2.0, 2.5, 3.0):
+        tr, cv, _, _ = run_scalp(df, make_params(rr=rr))
+        m = metrics(tr, cv, p.capital)
+        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
+        print(f"RR {rr} : {line}", flush=True)
+
+    print("\n=== OBJECTIF JOURNALIER (% du CAPITAL INITIAL) ===", flush=True)
+    for tgt, loss in ((5, 5), (10, 10), (20, 15), (30, 15), (50, 25)):
+        tr, cv, inf2, dl2 = run_scalp(df, make_params(daily_target=tgt, daily_loss=loss))
+        m = metrics(tr, cv, p.capital)
+        if m.get("n") and len(dl2):
+            best_d = dl2["ret_pct_on_initial"].max()
+            worst_d = dl2["ret_pct_on_initial"].min()
+            print(f"TP +{tgt}%/SL -{loss}% : {m['exp']:+.2f}R | "
+                  f"meilleur {best_d:+.1f}% pire {worst_d:+.1f}% (cap. init) | "
+                  f"n={m['n']} | arrêts obj:{inf2.get('days_target_hit', 0)} "
+                  f"perte:{inf2.get('days_loss_hit', 0)}", flush=True)
+        else:
+            print(f"TP +{tgt}%/SL -{loss}% : aucun trade", flush=True)
+
+    print("\nLecture : l'espérance NETTE doit rester > 0 partout, "
+          "et le pire jour ne doit jamais dépasser -15% du capital initial.", flush=True)
 
 
 # ------------------------------------------------------------------------------
-# Service & main
+# Service Render & main
 # ------------------------------------------------------------------------------
 async def health_server():
     port = int(os.getenv("PORT", 10000))
@@ -416,7 +542,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"Backtest SMC scalp OK"
+            body = b"Backtest SMC V4 OK"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -452,12 +578,13 @@ async def main():
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s) | session {SESSION} | spread {SPREAD}")
+    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s) | "
+        f"session {SESSION} | spread {SPREAD} | risque {RISK_PCT}%")
 
     try:
         df = await fetch_history(account, SYMBOL, TIMEFRAME, YEARS)
         if df is None:
-            print(f"[{SYMBOL}] Aucune bougie reçue (historique indisponible ?).", flush=True)
+            print(f"[{SYMBOL}] Aucune bougie reçue.", flush=True)
         else:
             report(SYMBOL, df)
     except Exception as e:
