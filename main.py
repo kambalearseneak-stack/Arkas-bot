@@ -15,7 +15,7 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "XAUUSD,US500,EURUSD").split(",") if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "XAUUSD").split(",") if s.strip()]
 YEARS = float(os.getenv("BT_YEARS", "3.0"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
 TIMEFRAME = "1d"
@@ -85,19 +85,16 @@ def get_spread(symbol):
 def make_params(**over):
     p = argparse.Namespace(
         slippage=0.0, risk=RISK_PCT,
-        # Donchian
-        entry_period=20,           # canal Donchian entrée
-        exit_period=10,            # canal Donchian sortie (trailing)
-        ema_filter=200,            # filtre tendance longue
+        entry_period=20,
+        exit_period=10,
+        ema_filter=200,
         use_ema_filter=True,
-        # Filtre ATR
-        min_atr_ratio=0.5,         # ATR courant >= 0.5 * ATR moyen
+        min_atr_ratio=0.5,
         atr_period=20,
-        # Gestion
-        max_hold=200,              # 200 jours max de tenue (sécurité)
+        max_hold=200,
         max_positions=3,
         max_total_risk_pct=3.0,
-        max_spread_ratio=0.05,     # spread <= 5% du risque initial
+        max_spread_ratio=0.05,
         capital=INITIAL_CAPITAL,
         long_only=False, short_only=False,
         exclude_days=None,
@@ -122,7 +119,7 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
     atr_avg = pd.Series(atr).rolling(100, min_periods=20).mean().to_numpy()
     ema_long = pd.Series(c).ewm(span=p.ema_filter, adjust=False).mean().to_numpy()
 
-    # Canaux Donchian — décalés de 1 bougie pour ne pas utiliser la bougie courante
+    # Canaux Donchian — décalés de 1 bougie
     dc_hi_entry = pd.Series(h).rolling(p.entry_period).max().shift(1).to_numpy()
     dc_lo_entry = pd.Series(l).rolling(p.entry_period).min().shift(1).to_numpy()
     dc_hi_exit = pd.Series(h).rolling(p.exit_period).max().shift(1).to_numpy()
@@ -206,13 +203,10 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
             cur_day = day_values[i]
             day_open_equity = equity
 
-        # ---- Gestion positions : trailing Donchian exit ----
         for pos in list(positions):
             if i <= pos["entry_i"]:
                 continue
             dr = pos["dir"]
-
-            # Mise à jour du SL avec le canal de sortie (trailing Donchian)
             if p.use_trailing:
                 if dr == 1:
                     new_stop = dc_lo_exit[i]
@@ -225,7 +219,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                         pos["stop"] = new_stop
                         info["trail_moves"] += 1
 
-            # Vérif SL touché
             if dr == 1:
                 if o[i] <= pos["stop"]:
                     close_position(pos, i, min(pos["stop"], o[i]), "trail (gap)", "sl")
@@ -241,13 +234,11 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                     close_position(pos, i, pos["stop"], "trail")
                     info["exit_by_trail"] += 1
 
-            # Timeout
             if pos in positions:
                 if i - pos["entry_i"] + 1 >= p.max_hold:
                     close_position(pos, i, c[i], "temps")
                     info["exit_by_timeout"] += 1
 
-        # ---- Signaux Donchian ----
         in_session = weekdays[i] < 5
         can_trade = (in_session and i >= max(start_idx, p.entry_period + p.ema_filter + 5)
                      and i > 0 and np.isfinite(atr[i]) and np.isfinite(atr_avg[i])
@@ -255,16 +246,12 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                      and len(positions) < p.max_positions)
         if can_trade:
             A = atr[i]
-            # Filtre ATR : volatilité minimale
             atr_ok = A >= p.min_atr_ratio * atr_avg[i]
             if not atr_ok:
                 info["rejected_atr"] += 1
             else:
-                # Filtre EMA long terme
                 ema_ok_long = (not p.use_ema_filter) or (c[i] > ema_long[i])
                 ema_ok_short = (not p.use_ema_filter) or (c[i] < ema_long[i])
-
-                # Détection breakout
                 bull_break = c[i] > dc_hi_entry[i]
                 bear_break = c[i] < dc_lo_entry[i]
 
@@ -275,23 +262,19 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                     candidates.append((-1, dc_lo_entry[i]))
 
                 for dr, trigger_px in candidates:
-                    # SL = canal Donchian exit (10 jours)
                     if dr == 1:
                         sl_px = dc_lo_exit[i]
                     else:
                         sl_px = dc_hi_exit[i]
                     if not np.isfinite(sl_px):
                         continue
-                    # Entry = close actuel + coûts
                     entry = c[i] + dr * (half_spread + slip)
                     dist = abs(entry - sl_px)
                     if dist <= 0:
                         continue
-                    # Filtre spread
                     if spread > p.max_spread_ratio * dist:
                         info["rejected_spread"] += 1
                         continue
-                    # Cap taille
                     risk_money = max(equity, 0.0) * p.risk / 100.0
                     if risk_money <= 0:
                         continue
@@ -301,7 +284,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                     if global_state["positions_total"] >= p.max_positions:
                         info["rejected_max_pos"] += 1
                         continue
-                    # Open position
                     positions.append({
                         "dir": dr, "entry": entry,
                         "stop": sl_px, "stop_initial": sl_px,
@@ -315,7 +297,7 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                         info["signals_long"] += 1
                     else:
                         info["signals_short"] += 1
-                    break  # un seul trade par symbole par jour
+                    break
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
         curve[i] = equity + open_pnl
@@ -406,6 +388,22 @@ def show_multi(title, m, info, trades):
                   f"exp={r.mean():+.3f}R | pnl={g['pnl'].sum():+.2f}")
 
 
+def run_single_symbol(dfs, symbols, params_override, label, p_base):
+    """Run un scénario avec des paramètres spécifiques et retourne (trades, metrics)."""
+    gs = {"positions_total": 0, "trades_today": {}}
+    results = []
+    for s in symbols:
+        df = dfs.get(s)
+        if df is None or not len(df):
+            continue
+        p = make_params(**params_override) if params_override else p_base
+        tr, cv, inf, dl = run_donchian(df, p, symbol=s, global_state=gs)
+        results.append((s, tr, cv, inf, dl))
+    t, _ = merge_results(results)
+    m = metrics_multi(t, p_base.capital)
+    return t, m
+
+
 def report(symbols, dfs, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
@@ -415,6 +413,7 @@ def report(symbols, dfs, oos=0.30):
     print(f"# AUCUN ordre réel. Simulation OHLC D1.")
     print("#" * 64)
 
+    # ---- Run principal ----
     global_state = {"positions_total": 0, "trades_today": {}}
     results = []
     for s in symbols:
@@ -426,7 +425,7 @@ def report(symbols, dfs, oos=0.30):
 
     trades, info = merge_results(results)
     m = metrics_multi(trades, p.capital)
-    show_multi("PERIODE COMPLETE (MULTI)", m, info, trades)
+    show_multi("PERIODE COMPLETE (DEFAUT)", m, info, trades)
 
     if m.get("n"):
         t_d = trades.copy()
@@ -440,84 +439,60 @@ def report(symbols, dfs, oos=0.30):
                 m2 = metrics_multi(t2, p.capital)
                 show_multi(f"SANS LE MEILLEUR JOUR ({best_day:%Y-%m-%d})", m2, info, t2)
 
+    # ---- Robustesse entry_period ----
     print("\n=== ROBUSTESSE : entry_period (net R | rend.% | n) ===")
     for ep in (10, 20, 40, 60):
-        gs = {"positions_total": 0, "trades_today": {}}
-        r2 = []
-        for s in symbols:
-            df = dfs.get(s)
-            if df is None or not len(df):
-                continue
-            tr, cv, inf, dl = run_donchian(df, make_params(entry_period=ep), symbol=s, global_state=gs)
-            r2.append((s, tr, cv, inf, dl))
-        t2, _ = merge_results(r2)
-        m2 = metrics_multi(t2, p.capital)
+        t2, m2 = run_single_symbol(dfs, symbols, {"entry_period": ep}, f"DC{ep}", p)
         if m2.get("n"):
             print(f"DC {ep} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
+    # ---- Robustesse exit_period ----
     print("\n=== ROBUSTESSE : exit_period (net R | rend.% | n) ===")
     for xp in (5, 10, 20):
-        gs = {"positions_total": 0, "trades_today": {}}
-        r2 = []
-        for s in symbols:
-            df = dfs.get(s)
-            if df is None or not len(df):
-                continue
-            tr, cv, inf, dl = run_donchian(df, make_params(exit_period=xp), symbol=s, global_state=gs)
-            r2.append((s, tr, cv, inf, dl))
-        t2, _ = merge_results(r2)
-        m2 = metrics_multi(t2, p.capital)
+        t2, m2 = run_single_symbol(dfs, symbols, {"exit_period": xp}, f"Exit{xp}", p)
         if m2.get("n"):
             print(f"Exit DC {xp} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
+    # ---- Robustesse EMA ----
     print("\n=== ROBUSTESSE : EMA filter (net R | rend.% | n) ===")
     for ef in (100, 150, 200, 300):
-        gs = {"positions_total": 0, "trades_today": {}}
-        r2 = []
-        for s in symbols:
-            df = dfs.get(s)
-            if df is None or not len(df):
-                continue
-            tr, cv, inf, dl = run_donchian(df, make_params(ema_filter=ef), symbol=s, global_state=gs)
-            r2.append((s, tr, cv, inf, dl))
-        t2, _ = merge_results(r2)
-        m2 = metrics_multi(t2, p.capital)
+        t2, m2 = run_single_symbol(dfs, symbols, {"ema_filter": ef}, f"EMA{ef}", p)
         if m2.get("n"):
             print(f"EMA {ef} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
+    # ---- Robustesse ATR ----
     print("\n=== ROBUSTESSE : filtre ATR (net R | rend.% | n) ===")
     for ar in (0.3, 0.5, 0.7, 1.0):
-        gs = {"positions_total": 0, "trades_today": {}}
-        r2 = []
-        for s in symbols:
-            df = dfs.get(s)
-            if df is None or not len(df):
-                continue
-            tr, cv, inf, dl = run_donchian(df, make_params(min_atr_ratio=ar), symbol=s, global_state=gs)
-            r2.append((s, tr, cv, inf, dl))
-        t2, _ = merge_results(r2)
-        m2 = metrics_multi(t2, p.capital)
+        t2, m2 = run_single_symbol(dfs, symbols, {"min_atr_ratio": ar}, f"ATR{ar}", p)
         if m2.get("n"):
             print(f"ATR min {ar}x : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
+    # ---- Sans EMA ----
     print("\n=== SANS filtre EMA (net R | rend.% | n) ===")
-    gs = {"positions_total": 0, "trades_today": {}}
-    r2 = []
-    for s in symbols:
-        df = dfs.get(s)
-        if df is None or not len(df):
-            continue
-        tr, cv, inf, dl = run_donchian(df, make_params(use_ema_filter=False), symbol=s, global_state=gs)
-        r2.append((s, tr, cv, inf, dl))
-    t2, _ = merge_results(r2)
-    m2 = metrics_multi(t2, p.capital)
+    t2, m2 = run_single_symbol(dfs, symbols, {"use_ema_filter": False}, "NoEMA", p)
     if m2.get("n"):
         print(f"Sans EMA : {m2.get('exp', np.nan):+.3f}R | "
               f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
+
+    # ---- Combinaison optimale (DC10 + Exit20 + EMA300) ----
+    print("\n=== COMBINAISONS OPTIMALES ===")
+    combos = [
+        ({"entry_period": 10}, "DC10"),
+        ({"entry_period": 10, "exit_period": 20}, "DC10+Exit20"),
+        ({"entry_period": 10, "exit_period": 20, "ema_filter": 300}, "DC10+Exit20+EMA300"),
+        ({"entry_period": 20, "exit_period": 20, "ema_filter": 300}, "DC20+Exit20+EMA300"),
+        ({"entry_period": 10, "exit_period": 20, "ema_filter": 300, "min_atr_ratio": 0.3}, "DC10+Exit20+EMA300+ATR0.3"),
+    ]
+    for kw, label in combos:
+        t2, m2 = run_single_symbol(dfs, symbols, kw, label, p)
+        if m2.get("n"):
+            print(f"{label:30s} : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | "
+                  f"DD {m2.get('dd', np.nan):.1f}% | n={m2['n']}")
 
     print("\nLecture : viser espérance > +0,10 R, PF > 1, stabilité sur DC/EMA/ATR.",
           flush=True)
