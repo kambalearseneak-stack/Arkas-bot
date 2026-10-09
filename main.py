@@ -1,12 +1,14 @@
-"""ARKAS RANGE POC — V10 backtest only.
+"""ARKAS RANGE REJECT — V11 backtest only.
 No order-placement API is used. Simulations are candle-based, not tick-accurate.
+AUCUN ordre limite : entrée AU MARCHÉ au close de la bougie de rejet.
 
-Stratégie : Range Fade avec ordre limite au POC (Point of Control = milieu du range).
-  1. Identifier le range sur les N dernières bougies (Range High / Range Low).
-  2. POC = milieu du range (ratio 0.5 par défaut).
-  3. Quand le prix CASSE le range, placer un ordre LIMITE au POC dans le sens opposé.
-  4. Attendre le retour du prix au POC (validité X bougies).
-  5. SL = au-delà du bord cassé + marge ATR. TP = bord opposé du range.
+Stratégie : Range Fade avec confirmation de rejet sur zone POC.
+  1. Range détecté sur N bougies (high/low).
+  2. Cassure : clôture hors du range.
+  3. On attend le retour du prix dans la ZONE POC (POC ± tolérance ATR).
+  4. Confirmation : bougie de REJET (mèche longue + clôture inverse).
+  5. Entrée au CLOSE de la bougie de rejet (marché, pas de limite).
+  6. SL au-delà du bord cassé, TP au bord opposé.
 """
 import argparse
 import asyncio
@@ -25,7 +27,7 @@ SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
 YEARS = float(os.getenv("BT_YEARS", "1.0"))
 SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = os.getenv("BT_TF", "1h")
+TIMEFRAME = os.getenv("BT_TF", "15m")
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
 
 
@@ -47,9 +49,9 @@ async def fetch_history(account, symbol, timeframe, years):
         oldest = batch[0]["time"]
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        if len(rows) % 2000 < 1000:
+        if len(rows) % 5000 < 1000:
             log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 60000:
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 120000:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -73,14 +75,21 @@ async def fetch_history(account, symbol, timeframe, years):
 def make_params(**over):
     p = argparse.Namespace(
         spread=SPREAD, slippage=0.05, risk=RISK_PCT,
-        lookback_bars=24,
+        # Range
+        lookback_bars=96,             # M15 : 96 bars = 24h
         min_range_atr=1.0, max_range_atr=8.0,
         poc_ratio=0.5,
-        limit_valid_bars=12,
+        # Zone POC
+        poc_zone_atr=0.25,
+        # Confirmation rejet
+        wick_body_min=1.5,
+        break_timeout_bars=16,
+        # SL/TP
         sl_pad_atr=0.5,
         sl_min_atr=1.0, sl_max_atr=4.0,
         tp_mode="opposite",
         rr=2.0,
+        # Gestion
         max_hold=48,
         max_consec=2,
         max_positions=1,
@@ -97,9 +106,31 @@ def make_params(**over):
     return p
 
 
-def run_range_poc(df, p, start_idx=0):
+def is_bullish_reject(o_i, h_i, l_i, c_i, wick_body_min):
+    body = abs(c_i - o_i)
+    rng = h_i - l_i
+    if rng <= 0 or c_i <= o_i:
+        return False
+    lower_wick = min(o_i, c_i) - l_i
+    if body < 1e-12:
+        return lower_wick > 0.7 * rng
+    return lower_wick >= wick_body_min * body
+
+
+def is_bearish_reject(o_i, h_i, l_i, c_i, wick_body_min):
+    body = abs(c_i - o_i)
+    rng = h_i - l_i
+    if rng <= 0 or c_i >= o_i:
+        return False
+    upper_wick = h_i - max(o_i, c_i)
+    if body < 1e-12:
+        return upper_wick > 0.7 * rng
+    return upper_wick >= wick_body_min * body
+
+
+def run_range_reject(df, p, start_idx=0):
     d = df.reset_index(drop=True).copy()
-    if len(d) < max(60, p.atr + 2):
+    if len(d) < max(120, p.atr + 2):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
 
     o, h, l, c = (d[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
@@ -114,9 +145,12 @@ def run_range_poc(df, p, start_idx=0):
     slip = max(float(p.slippage), 0.0)
 
     equity = float(p.capital)
-    positions, pending_orders, trades = [], [], []
+    positions, trades = [], []
     curve = np.full(n, np.nan)
     daily_rows = []
+
+    # Watch : après une cassure, on surveille le retour dans la zone POC
+    watch = None
 
     excluded = set()
     if p.exclude_days:
@@ -130,10 +164,10 @@ def run_range_poc(df, p, start_idx=0):
 
     info = {
         "signals_long": 0, "signals_short": 0,
+        "breaks_detected": 0, "breaks_timeout": 0,
+        "returns_to_zone": 0, "rejections_valid": 0, "rejections_invalid": 0,
         "rejected_range": 0, "rejected_spread": 0,
         "rejected_max_pos": 0, "rejected_max_risk": 0,
-        "orders_placed": 0, "orders_filled": 0,
-        "orders_expired": 0, "orders_cancelled": 0,
         "fills_stop_gap": 0, "fills_tp_gap": 0,
         "days_consec_hit": 0,
     }
@@ -223,78 +257,63 @@ def run_range_poc(df, p, start_idx=0):
                 elif i + 1 >= n or weekdays[i + 1] >= 5:
                     close_position(pos, i, c[i], "fin de semaine")
 
-        # ---- Gestion des ordres limites en attente ----
-        still_pending = []
-        for order in pending_orders:
-            if i - order["placed_i"] >= p.limit_valid_bars:
-                info["orders_expired"] += 1
-                continue
-            if len(positions) >= p.max_positions:
-                info["orders_cancelled"] += 1
-                continue
-            dr = order["dir"]
-            poc = order["poc"]
-            filled = False
-            if dr == 1:
-                if l[i] <= poc:
-                    fill_price = min(poc, o[i])
-                    entry = fill_price + dr * (half_spread + slip)
-                    dist = order["dist"]
-                    if p.spread > p.max_spread_ratio * dist:
-                        info["rejected_spread"] += 1
-                        continue
-                    risk_money = max(equity, 0.0) * p.risk / 100.0
-                    if risk_money <= 0:
-                        continue
-                    if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
-                        info["rejected_max_risk"] += 1
-                        continue
-                    positions.append({
-                        "dir": dr, "entry": entry,
-                        "stop": order["stop"], "tp": order["tp"],
-                        "dist": dist, "size": risk_money / dist,
-                        "risk_money": risk_money,
-                        "entry_time": times[i], "entry_i": i,
-                    })
-                    info["orders_filled"] += 1
-                    info["signals_long"] += 1
-                    filled = True
+        # ---- Surveillance du retour dans la zone POC après une cassure ----
+        if watch is not None and len(positions) < p.max_positions:
+            if i - watch["placed_i"] >= p.break_timeout_bars:
+                info["breaks_timeout"] += 1
+                watch = None
             else:
-                if h[i] >= poc:
-                    fill_price = max(poc, o[i])
-                    entry = fill_price + dr * (half_spread + slip)
-                    dist = order["dist"]
-                    if p.spread > p.max_spread_ratio * dist:
-                        info["rejected_spread"] += 1
-                        continue
-                    risk_money = max(equity, 0.0) * p.risk / 100.0
-                    if risk_money <= 0:
-                        continue
-                    if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
-                        info["rejected_max_risk"] += 1
-                        continue
-                    positions.append({
-                        "dir": dr, "entry": entry,
-                        "stop": order["stop"], "tp": order["tp"],
-                        "dist": dist, "size": risk_money / dist,
-                        "risk_money": risk_money,
-                        "entry_time": times[i], "entry_i": i,
-                    })
-                    info["orders_filled"] += 1
-                    info["signals_short"] += 1
-                    filled = True
-            if not filled:
-                still_pending.append(order)
-        pending_orders = still_pending
+                dr = watch["dir"]
+                zone_lo, zone_hi = watch["zone_lo"], watch["zone_hi"]
+                price_in_zone = (l[i] <= zone_hi) and (h[i] >= zone_lo)
+                if price_in_zone:
+                    info["returns_to_zone"] += 1
+                    if dr == 1:
+                        reject_ok = is_bullish_reject(o[i], h[i], l[i], c[i], p.wick_body_min)
+                    else:
+                        reject_ok = is_bearish_reject(o[i], h[i], l[i], c[i], p.wick_body_min)
 
-        # ---- Détection breakout pour placer un ordre limite au POC ----
+                    if reject_ok:
+                        info["rejections_valid"] += 1
+                        dist = watch["dist"]
+                        if p.spread > p.max_spread_ratio * dist:
+                            info["rejected_spread"] += 1
+                            watch = None
+                        else:
+                            risk_money = max(equity, 0.0) * p.risk / 100.0
+                            if risk_money > 0 and open_risk_pct() + risk_money / p.capital * 100.0 <= p.max_total_risk_pct:
+                                # ENTRÉE AU MARCHÉ au close de la bougie de rejet
+                                entry = c[i] + dr * (half_spread + slip)
+                                sl_px = entry - dr * dist
+                                if watch["tp_mode"] == "opposite":
+                                    tp_px = watch["rng_hi"] if dr == 1 else watch["rng_lo"]
+                                else:
+                                    tp_px = entry + dr * dist * p.rr
+                                positions.append({
+                                    "dir": dr, "entry": entry,
+                                    "stop": sl_px, "tp": tp_px,
+                                    "dist": dist, "size": risk_money / dist,
+                                    "risk_money": risk_money,
+                                    "entry_time": times[i], "entry_i": i,
+                                })
+                                if dr == 1:
+                                    info["signals_long"] += 1
+                                else:
+                                    info["signals_short"] += 1
+                                watch = None
+                            else:
+                                info["rejected_max_risk"] += 1
+                                watch = None
+                    else:
+                        info["rejections_invalid"] += 1
+
+        # ---- Détection d'une cassure pour créer un watch ----
         in_session = weekdays[i] < 5
-        can_place = (not day_halted and in_session
+        can_watch = (not day_halted and in_session
                      and i >= max(start_idx, p.lookback_bars)
                      and i > 0 and np.isfinite(atr[i])
-                     and len(pending_orders) == 0
-                     and len(positions) < p.max_positions)
-        if can_place:
+                     and watch is None and len(positions) < p.max_positions)
+        if can_watch:
             A = atr[i]
             rng_hi = h[i - p.lookback_bars:i].max()
             rng_lo = l[i - p.lookback_bars:i].min()
@@ -304,32 +323,31 @@ def run_range_poc(df, p, start_idx=0):
                 info["rejected_range"] += 1
             else:
                 poc = rng_lo + p.poc_ratio * rng
+                zone_half = p.poc_zone_atr * A
+                zone_lo = poc - zone_half
+                zone_hi = poc + zone_half
                 bull_break = c[i] > rng_hi
                 bear_break = c[i] < rng_lo
 
                 if bear_break and not p.short_only:
-                    sl_dist = rng_lo - p.sl_pad_atr * A
-                    sl_dist = min(max(abs(poc - sl_dist), p.sl_min_atr * A), p.sl_max_atr * A)
-                    sl_px = poc - sl_dist
-                    tp_px = rng_hi if p.tp_mode == "opposite" else poc + p.rr * sl_dist
-                    pending_orders.append({
-                        "dir": 1, "poc": poc, "dist": sl_dist,
-                        "stop": sl_px, "tp": tp_px,
-                        "placed_i": i, "rng_hi": rng_hi, "rng_lo": rng_lo,
-                    })
-                    info["orders_placed"] += 1
+                    sl_dist = max(abs(poc - (rng_lo - p.sl_pad_atr * A)), 0.0)
+                    sl_dist = min(max(sl_dist, p.sl_min_atr * A), p.sl_max_atr * A)
+                    watch = {
+                        "dir": 1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
+                        "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
+                        "placed_i": i, "tp_mode": p.tp_mode,
+                    }
+                    info["breaks_detected"] += 1
 
-                if bull_break and not p.long_only:
-                    sl_dist = rng_hi + p.sl_pad_atr * A
-                    sl_dist = min(max(abs(sl_dist - poc), p.sl_min_atr * A), p.sl_max_atr * A)
-                    sl_px = poc + sl_dist
-                    tp_px = rng_lo if p.tp_mode == "opposite" else poc - p.rr * sl_dist
-                    pending_orders.append({
-                        "dir": -1, "poc": poc, "dist": sl_dist,
-                        "stop": sl_px, "tp": tp_px,
-                        "placed_i": i, "rng_hi": rng_hi, "rng_lo": rng_lo,
-                    })
-                    info["orders_placed"] += 1
+                elif bull_break and not p.long_only:
+                    sl_dist = max(abs((rng_hi + p.sl_pad_atr * A) - poc), 0.0)
+                    sl_dist = min(max(sl_dist, p.sl_min_atr * A), p.sl_max_atr * A)
+                    watch = {
+                        "dir": -1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
+                        "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
+                        "placed_i": i, "tp_mode": p.tp_mode,
+                    }
+                    info["breaks_detected"] += 1
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
         curve[i] = equity + open_pnl
@@ -399,14 +417,18 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"\n=== {title} ===")
     if not m.get("n"):
         print("Aucun trade.")
+        print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
+        print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
+        print(f"  rejets valides  : {info.get('rejections_valid', 0)}")
         return
     print(f"Jours             : {m.get('days', 0)}")
     print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour)")
     print(f"Longs/shorts      : {info.get('signals_long', 0)}/{info.get('signals_short', 0)}")
-    print(f"Ordres placés     : {info.get('orders_placed', 0)}")
-    print(f"  remplis         : {info.get('orders_filled', 0)}")
-    print(f"  expirés         : {info.get('orders_expired', 0)}")
-    print(f"  annulés         : {info.get('orders_cancelled', 0)}")
+    print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
+    print(f"  timeouts        : {info.get('breaks_timeout', 0)}")
+    print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
+    print(f"  rejets valides  : {info.get('rejections_valid', 0)}")
+    print(f"  rejets invalides: {info.get('rejections_invalid', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
     print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
@@ -415,8 +437,6 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
     print(f"Pires pertes suite: {m.get('streak', 0)}")
     print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}")
-    print(f"Rejets (range)    : {info.get('rejected_range', 0)}")
-    print(f"Rejets (spread)   : {info.get('rejected_spread', 0)}")
     print(f"Sorties           : {m.get('reasons', {})}")
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %")
@@ -432,12 +452,12 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
 def report(symbol, df, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS RANGE POC V10 | {symbol} {TIMEFRAME} | {len(df)} bougies")
+    print(f"# ARKAS RANGE REJECT V11 | {symbol} {TIMEFRAME} | {len(df)} bougies")
     print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}")
-    print(f"# Range {p.lookback_bars} bars | POC {p.poc_ratio} | "
-          f"ordre valide {p.limit_valid_bars} bars | SL pad {p.sl_pad_atr}ATR | "
+    print(f"# Range {p.lookback_bars} bars | POC {p.poc_ratio} | zone ±{p.poc_zone_atr}ATR | "
+          f"mèche/corps ≥ {p.wick_body_min} | timeout {p.break_timeout_bars} bars | "
           f"TP {p.tp_mode} | spread {p.spread} | risque {p.risk}%")
-    print("# ATTENTION: simulation OHLC, aucun ordre réel.")
+    print("# AUCUN ordre limite : entrée marché au close de la bougie de rejet.")
     print("#" * 64)
     if len(df) < 2000:
         print("Historique insuffisant (< 2000 bougies).")
@@ -445,22 +465,23 @@ def report(symbol, df, oos=0.30):
 
     bh = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100.0
 
-    tr, cv, inf, dl = run_range_poc(df, p)
+    tr, cv, inf, dl = run_range_reject(df, p)
     m = metrics(tr, cv, p.capital)
     show("PERIODE COMPLETE", m, inf, dl, tr, bh)
 
-    cs = concentration_stats(tr, dl)
-    best_day = cs.get("best_day_date")
-    if best_day is not None and pd.notna(best_day):
-        excluded_day = pd.Timestamp(best_day).normalize()
-        p2 = make_params(exclude_days=[excluded_day])
-        tr2, cv2, inf2, dl2 = run_range_poc(df, p2)
-        m2 = metrics(tr2, cv2, p2.capital)
-        show(f"SANS LE MEILLEUR JOUR ({excluded_day:%Y-%m-%d})", m2, inf2, dl2, tr2, bh, False)
+    if m.get("n"):
+        cs = concentration_stats(tr, dl)
+        best_day = cs.get("best_day_date")
+        if best_day is not None and pd.notna(best_day):
+            excluded_day = pd.Timestamp(best_day).normalize()
+            p2 = make_params(exclude_days=[excluded_day])
+            tr2, cv2, inf2, dl2 = run_range_reject(df, p2)
+            m2 = metrics(tr2, cv2, p2.capital)
+            show(f"SANS LE MEILLEUR JOUR ({excluded_day:%Y-%m-%d})", m2, inf2, dl2, tr2, bh, False)
 
     print("\n=== SENSIBILITE SPREAD (net R | rend.% | DD% | n) ===")
     for sp in (0.10, 0.30, 0.50, 1.0):
-        tr_s, cv_s, _, _ = run_range_poc(df, make_params(spread=sp))
+        tr_s, cv_s, _, _ = run_range_reject(df, make_params(spread=sp))
         m_s = metrics(tr_s, cv_s, p.capital)
         if m_s.get("n"):
             print(f"spread {sp:.2f} : {m_s.get('exp', np.nan):+.3f}R | "
@@ -468,21 +489,37 @@ def report(symbol, df, oos=0.30):
         else:
             print(f"spread {sp:.2f} : aucun trade")
 
+    print("\n=== ROBUSTESSE : mèche/corps minimum (net R | rend.% | n) ===")
+    for wb in (1.0, 1.5, 2.0, 3.0):
+        tr_w, cv_w, _, _ = run_range_reject(df, make_params(wick_body_min=wb))
+        m_w = metrics(tr_w, cv_w, p.capital)
+        if m_w.get("n"):
+            print(f"wick/body {wb} : {m_w.get('exp', np.nan):+.3f}R | "
+                  f"{m_w.get('ret', np.nan):+.1f}% | n={m_w['n']}")
+
+    print("\n=== ROBUSTESSE : zone POC (± ATR) (net R | rend.% | n) ===")
+    for pz in (0.15, 0.25, 0.50):
+        tr_z, cv_z, _, _ = run_range_reject(df, make_params(poc_zone_atr=pz))
+        m_z = metrics(tr_z, cv_z, p.capital)
+        if m_z.get("n"):
+            print(f"zone ±{pz} ATR : {m_z.get('exp', np.nan):+.3f}R | "
+                  f"{m_z.get('ret', np.nan):+.1f}% | n={m_z['n']}")
+
+    print("\n=== ROBUSTESSE : timeout retour (net R | rend.% | n) ===")
+    for tb in (8, 16, 32):
+        tr_t, cv_t, _, _ = run_range_reject(df, make_params(break_timeout_bars=tb))
+        m_t = metrics(tr_t, cv_t, p.capital)
+        if m_t.get("n"):
+            print(f"timeout {tb} : {m_t.get('exp', np.nan):+.3f}R | "
+                  f"{m_t.get('ret', np.nan):+.1f}% | n={m_t['n']}")
+
     print("\n=== ROBUSTESSE : lookback range (net R | rend.% | n) ===")
-    for lb in (12, 24, 48, 96):
-        tr_l, cv_l, _, _ = run_range_poc(df, make_params(lookback_bars=lb))
+    for lb in (48, 96, 192, 288):
+        tr_l, cv_l, _, _ = run_range_reject(df, make_params(lookback_bars=lb))
         m_l = metrics(tr_l, cv_l, p.capital)
         if m_l.get("n"):
             print(f"LB {lb} : {m_l.get('exp', np.nan):+.3f}R | "
                   f"{m_l.get('ret', np.nan):+.1f}% | n={m_l['n']}")
-
-    print("\n=== ROBUSTESSE : POC ratio (net R | rend.% | n) ===")
-    for pr in (0.382, 0.5, 0.618, 0.75):
-        tr_p, cv_p, _, _ = run_range_poc(df, make_params(poc_ratio=pr))
-        m_p = metrics(tr_p, cv_p, p.capital)
-        if m_p.get("n"):
-            print(f"POC {pr} : {m_p.get('exp', np.nan):+.3f}R | "
-                  f"{m_p.get('ret', np.nan):+.1f}% | n={m_p['n']}")
 
     print("\n=== ROBUSTESSE : TP mode (net R | rend.% | n) ===")
     for mode in ("opposite", "rr"):
@@ -490,27 +527,19 @@ def report(symbol, df, oos=0.30):
             kw = {"tp_mode": mode}
             if rr is not None:
                 kw["rr"] = rr
-            tr_t, cv_t, _, _ = run_range_poc(df, make_params(**kw))
-            m_t = metrics(tr_t, cv_t, p.capital)
-            if m_t.get("n"):
+            tr_tp, cv_tp, _, _ = run_range_reject(df, make_params(**kw))
+            m_tp = metrics(tr_tp, cv_tp, p.capital)
+            if m_tp.get("n"):
                 label = f"{mode}" + (f" RR{rr}" if rr else "")
-                print(f"{label} : {m_t.get('exp', np.nan):+.3f}R | "
-                      f"{m_t.get('ret', np.nan):+.1f}% | n={m_t['n']}")
-
-    print("\n=== ROBUSTESSE : validité ordre limite (net R | rend.% | n) ===")
-    for vb in (6, 12, 24, 48):
-        tr_v, cv_v, _, _ = run_range_poc(df, make_params(limit_valid_bars=vb))
-        m_v = metrics(tr_v, cv_v, p.capital)
-        if m_v.get("n"):
-            print(f"valid {vb} bars : {m_v.get('exp', np.nan):+.3f}R | "
-                  f"{m_v.get('ret', np.nan):+.1f}% | n={m_v['n']}")
+                print(f"{label} : {m_tp.get('exp', np.nan):+.3f}R | "
+                      f"{m_tp.get('ret', np.nan):+.1f}% | n={m_tp['n']}")
 
     split = int(len(df) * (1.0 - oos))
     train_df = df.iloc[:split].reset_index(drop=True)
     test_df = df.iloc[split:].reset_index(drop=True)
     print(f"\n=== VALIDATION OOS CHRONOLOGIQUE ({100*oos:.0f}% final) ===")
     for label, part in (("TRAIN", train_df), ("OOS", test_df)):
-        tr_v, cv_v, inf_v, dl_v = run_range_poc(part, p)
+        tr_v, cv_v, inf_v, dl_v = run_range_reject(part, p)
         m_v = metrics(tr_v, cv_v, p.capital)
         if m_v.get("n"):
             print(f"{label:5s}: trades={m_v['n']:4d} | exp={m_v.get('exp', np.nan):+.3f}R | "
@@ -527,7 +556,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS RANGE POC V10 backtest service OK - no live orders"
+            body = b"ARKAS RANGE REJECT V11 backtest OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
