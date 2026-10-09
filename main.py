@@ -26,7 +26,6 @@ MAX_POSITIONS = int(os.getenv("BT_MAX_POSITIONS", "2"))
 MAX_TOTAL_RISK_PCT = float(os.getenv("BT_MAX_TOTAL_RISK", "2.0"))
 MAX_HOLD_HOURS = int(os.getenv("BT_MAX_HOLD_HOURS", "48"))
 
-# Paramètres Donchian (identiques au backtest validé)
 ENTRY_PERIOD = 20
 EXIT_PERIOD = 10
 EMA_FILTER = 200
@@ -34,13 +33,12 @@ ATR_PERIOD = 20
 MIN_ATR_RATIO = 0.4
 SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
 
-# Sécurité
 LIVE_MODE = os.getenv("LIVE_MODE", "true").lower() == "true"
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "15.0"))
 
 # ============================================================
-# SÉCURITÉS DURES — NON CONTOURNABLES
+# SÉCURITÉS DURES
 # ============================================================
 HARD_LIMITS = {
     "max_volume_per_order": 1.0,
@@ -70,11 +68,7 @@ def log(msg, level="INFO"):
     print(f"[{ts}] {prefix} [{level}] {msg}", flush=True)
 
 
-# ============================================================
-# SÉCURITÉS
-# ============================================================
 def check_hard_limits(order_volume, notional_usd, account_info):
-    """Vérifie les 6 sécurités dures. Retourne (ok, raison)."""
     now = datetime.now(timezone.utc)
 
     if order_volume > HARD_LIMITS["max_volume_per_order"]:
@@ -156,10 +150,9 @@ def check_signal(df, ind):
 
 
 # ============================================================
-# COMPTE (via connexion RPC)
+# COMPTE
 # ============================================================
 async def get_account_info(rpc):
-    """Récupère balance, equity, marge via la connexion RPC."""
     try:
         info = await rpc.get_account_information()
         return {
@@ -174,7 +167,6 @@ async def get_account_info(rpc):
 
 
 async def get_positions(rpc):
-    """Récupère les positions ouvertes via RPC."""
     try:
         positions = await rpc.get_positions()
         return [p for p in positions if p.get("symbol") == SYMBOL]
@@ -226,7 +218,6 @@ async def open_position(rpc, signal, equity):
             result = await rpc.create_market_sell_order(
                 symbol=SYMBOL, volume=size, stop_loss=signal["sl"]
             )
-        # Extraire l'ID d'ordre
         order_id = None
         if isinstance(result, dict):
             order_id = result.get("orderId") or result.get("positionId") or str(result)
@@ -305,7 +296,6 @@ async def process_bar(rpc, df):
     last_closed_time = df["time"].iloc[-2]
     last_close = df["close"].iloc[-2]
 
-    # ==== 1. Gestion des positions ====
     positions = await get_positions(rpc)
     for pos in positions:
         pos_id = pos.get("id") or pos.get("positionId")
@@ -316,7 +306,6 @@ async def process_bar(rpc, df):
         current_sl = float(pos.get("stopLoss", 0)) if pos.get("stopLoss") else None
         open_time = pos.get("time")
 
-        # A. Trailing Donchian
         new_sl = ind["dc_lo_exit"][-1] if dr == 1 else ind["dc_hi_exit"][-1]
         if np.isfinite(new_sl):
             if dr == 1 and (current_sl is None or new_sl > current_sl) and new_sl < last_close:
@@ -324,7 +313,6 @@ async def process_bar(rpc, df):
             elif dr == -1 and (current_sl is None or new_sl < current_sl) and new_sl > last_close:
                 await update_stop_loss(rpc, pos_id, new_sl)
 
-        # B. Timeout
         if open_time:
             try:
                 open_dt = pd.to_datetime(open_time, utc=True).tz_localize(None)
@@ -334,7 +322,6 @@ async def process_bar(rpc, df):
             except Exception:
                 pass
 
-    # ==== 2. Nouveau signal ====
     positions = await get_positions(rpc)
     if len(positions) >= MAX_POSITIONS:
         return
@@ -409,17 +396,19 @@ async def main():
     server_task = asyncio.create_task(health_server())
     keepalive_task = asyncio.create_task(keepalive())
 
-    api = MetaApi(TOKEN, {"region": REGION})
+    # Connexion MetaApi (compatible SDK 29.0+ : mot-clés explicites)
+    api = MetaApi(token=TOKEN, region=REGION)
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
     log("✅ Compte MetaApi connecté")
 
-    # ==== Connexion RPC (créée une seule fois) ====
-    rpc = await account.get_rpc_connection()
-    await rpc.wait_connected()
-    log("✅ Connexion RPC prête")
+    # ==== Connexion RPC (créée une seule fois, SANS await sur get_rpc_connection) ====
+    rpc = account.get_rpc_connection()
+    await rpc.connect()
+    await rpc.wait_synchronized()
+    log("✅ Connexion RPC prête et synchronisée")
 
     info = await get_account_info(rpc)
     log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f} | "
