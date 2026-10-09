@@ -1,6 +1,12 @@
-"""ARKAS MOMENTUM H1 — V9 backtest only.
+"""ARKAS RANGE POC — V10 backtest only.
 No order-placement API is used. Simulations are candle-based, not tick-accurate.
-Stratégie : momentum de tendance H1 sur indices (NAS100, US500, DAX...).
+
+Stratégie : Range Fade avec ordre limite au POC (Point of Control = milieu du range).
+  1. Identifier le range sur les N dernières bougies (Range High / Range Low).
+  2. POC = milieu du range (ratio 0.5 par défaut).
+  3. Quand le prix CASSE le range, placer un ordre LIMITE au POC dans le sens opposé.
+  4. Attendre le retour du prix au POC (validité X bougies).
+  5. SL = au-delà du bord cassé + marge ATR. TP = bord opposé du range.
 """
 import argparse
 import asyncio
@@ -15,11 +21,11 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOL = os.getenv("BT_SYMBOL = US Tech 100")      # <-- US Tech 00 par défaut
-YEARS = float(os.getenv("BT_YEARS", "1.0"))     # 1 an pour avoir assez de bougies H1
-SPREAD = float(os.getenv("BT_SPREAD", "1.0"))   # US Tech 100 : ~1 point de spread
+SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
+YEARS = float(os.getenv("BT_YEARS", "1.0"))
+SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = "1h"                                 # <-- H1
+TIMEFRAME = os.getenv("BT_TF", "1h")
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
 
 
@@ -27,9 +33,6 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ------------------------------------------------------------------------------
-# Historique
-# ------------------------------------------------------------------------------
 async def fetch_history(account, symbol, timeframe, years):
     target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
     rows, start, prev_oldest = [], None, None
@@ -46,7 +49,7 @@ async def fetch_history(account, symbol, timeframe, years):
             oldest = oldest.replace(tzinfo=timezone.utc)
         if len(rows) % 2000 < 1000:
             log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 30000:
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 60000:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -67,38 +70,34 @@ async def fetch_history(account, symbol, timeframe, years):
     return df.iloc[:-1].reset_index(drop=True)
 
 
-# ------------------------------------------------------------------------------
-# Paramètres
-# ------------------------------------------------------------------------------
 def make_params(**over):
     p = argparse.Namespace(
-        spread=SPREAD, slippage=0.5, risk=RISK_PCT, rr=2.5, atr=14,
-        ema_fast=20, ema_slow=50,          # biais H1
-        lookback_bars=12,                  # range de référence (12 bougies H1 = 12h)
-        min_range_atr=0.5, max_range_atr=5.0,
-        sl_pad_atr=0.3,                    # marge au-delà de la bougie de cassure
-        sl_min_atr=1.0, sl_max_atr=3.0,    # bornes du SL
-        max_hold=24,                       # 24 bougies H1 = 24h
+        spread=SPREAD, slippage=0.05, risk=RISK_PCT,
+        lookback_bars=24,
+        min_range_atr=1.0, max_range_atr=8.0,
+        poc_ratio=0.5,
+        limit_valid_bars=12,
+        sl_pad_atr=0.5,
+        sl_min_atr=1.0, sl_max_atr=4.0,
+        tp_mode="opposite",
+        rr=2.0,
+        max_hold=48,
         max_consec=2,
-        max_positions=2,
+        max_positions=1,
         max_total_risk_pct=2.0,
-        allow_same_dir=False,              # une position par sens
         max_spread_ratio=0.15,
+        atr=14,
         capital=INITIAL_CAPITAL,
-        long_only=False,
+        long_only=False, short_only=False,
         exclude_days=None,
-        gap_slip_tp=0.25,                  # NAS100 : gap plus rare mais possible
-        gap_slip_sl=0.25,
+        gap_slip_tp=0.25, gap_slip_sl=0.25,
     )
     for k, v in over.items():
         setattr(p, k, v)
     return p
 
 
-# ------------------------------------------------------------------------------
-# Moteur momentum H1
-# ------------------------------------------------------------------------------
-def run_momentum(df, p, start_idx=0):
+def run_range_poc(df, p, start_idx=0):
     d = df.reset_index(drop=True).copy()
     if len(d) < max(60, p.atr + 2):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
@@ -108,16 +107,14 @@ def run_momentum(df, p, start_idx=0):
     prev_close = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_close), np.abs(l - prev_close)])
     atr = pd.Series(tr).rolling(p.atr, min_periods=p.atr).mean().to_numpy()
-    ema_f = pd.Series(c).ewm(span=p.ema_fast, adjust=False).mean().to_numpy()
-    ema_s = pd.Series(c).ewm(span=p.ema_slow, adjust=False).mean().to_numpy()
     times = d["time"].to_numpy()
-    hours = d["time"].dt.hour.to_numpy()
     weekdays = d["time"].dt.weekday.to_numpy()
     day_values = d["time"].dt.normalize().to_numpy()
     half_spread = max(float(p.spread), 0.0) / 2.0
     slip = max(float(p.slippage), 0.0)
+
     equity = float(p.capital)
-    positions, trades = [], []
+    positions, pending_orders, trades = [], [], []
     curve = np.full(n, np.nan)
     daily_rows = []
 
@@ -135,7 +132,10 @@ def run_momentum(df, p, start_idx=0):
         "signals_long": 0, "signals_short": 0,
         "rejected_range": 0, "rejected_spread": 0,
         "rejected_max_pos": 0, "rejected_max_risk": 0,
-        "rejected_same_dir": 0, "fills_stop_gap": 0, "fills_tp_gap": 0,
+        "orders_placed": 0, "orders_filled": 0,
+        "orders_expired": 0, "orders_cancelled": 0,
+        "fills_stop_gap": 0, "fills_tp_gap": 0,
+        "days_consec_hit": 0,
     }
 
     def open_risk_pct():
@@ -176,7 +176,7 @@ def run_momentum(df, p, start_idx=0):
         if consec_losses >= p.max_consec and not day_halted:
             day_halted = True
             halt_reason = f"{p.max_consec} pertes consécutives"
-            info["days_consec_hit"] = info.get("days_consec_hit", 0) + 1
+            info["days_consec_hit"] += 1
 
     for i in range(n):
         day_key = np.datetime64(pd.Timestamp(day_values[i]).normalize(), "D")
@@ -223,10 +223,78 @@ def run_momentum(df, p, start_idx=0):
                 elif i + 1 >= n or weekdays[i + 1] >= 5:
                     close_position(pos, i, c[i], "fin de semaine")
 
-        # ---- Signal momentum ----
+        # ---- Gestion des ordres limites en attente ----
+        still_pending = []
+        for order in pending_orders:
+            if i - order["placed_i"] >= p.limit_valid_bars:
+                info["orders_expired"] += 1
+                continue
+            if len(positions) >= p.max_positions:
+                info["orders_cancelled"] += 1
+                continue
+            dr = order["dir"]
+            poc = order["poc"]
+            filled = False
+            if dr == 1:
+                if l[i] <= poc:
+                    fill_price = min(poc, o[i])
+                    entry = fill_price + dr * (half_spread + slip)
+                    dist = order["dist"]
+                    if p.spread > p.max_spread_ratio * dist:
+                        info["rejected_spread"] += 1
+                        continue
+                    risk_money = max(equity, 0.0) * p.risk / 100.0
+                    if risk_money <= 0:
+                        continue
+                    if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
+                        info["rejected_max_risk"] += 1
+                        continue
+                    positions.append({
+                        "dir": dr, "entry": entry,
+                        "stop": order["stop"], "tp": order["tp"],
+                        "dist": dist, "size": risk_money / dist,
+                        "risk_money": risk_money,
+                        "entry_time": times[i], "entry_i": i,
+                    })
+                    info["orders_filled"] += 1
+                    info["signals_long"] += 1
+                    filled = True
+            else:
+                if h[i] >= poc:
+                    fill_price = max(poc, o[i])
+                    entry = fill_price + dr * (half_spread + slip)
+                    dist = order["dist"]
+                    if p.spread > p.max_spread_ratio * dist:
+                        info["rejected_spread"] += 1
+                        continue
+                    risk_money = max(equity, 0.0) * p.risk / 100.0
+                    if risk_money <= 0:
+                        continue
+                    if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
+                        info["rejected_max_risk"] += 1
+                        continue
+                    positions.append({
+                        "dir": dr, "entry": entry,
+                        "stop": order["stop"], "tp": order["tp"],
+                        "dist": dist, "size": risk_money / dist,
+                        "risk_money": risk_money,
+                        "entry_time": times[i], "entry_i": i,
+                    })
+                    info["orders_filled"] += 1
+                    info["signals_short"] += 1
+                    filled = True
+            if not filled:
+                still_pending.append(order)
+        pending_orders = still_pending
+
+        # ---- Détection breakout pour placer un ordre limite au POC ----
         in_session = weekdays[i] < 5
-        if (not day_halted and in_session and i >= max(start_idx, p.lookback_bars)
-                and i > 0 and np.isfinite(atr[i])):
+        can_place = (not day_halted and in_session
+                     and i >= max(start_idx, p.lookback_bars)
+                     and i > 0 and np.isfinite(atr[i])
+                     and len(pending_orders) == 0
+                     and len(positions) < p.max_positions)
+        if can_place:
             A = atr[i]
             rng_hi = h[i - p.lookback_bars:i].max()
             rng_lo = l[i - p.lookback_bars:i].min()
@@ -235,51 +303,33 @@ def run_momentum(df, p, start_idx=0):
             if not valid_range:
                 info["rejected_range"] += 1
             else:
-                bull_bias = ema_f[i] > ema_s[i]
-                bear_bias = ema_f[i] < ema_s[i]
+                poc = rng_lo + p.poc_ratio * rng
+                bull_break = c[i] > rng_hi
+                bear_break = c[i] < rng_lo
 
-                candidates = []
-                # LONG : biais haussier + clôture au-dessus du range
-                if bull_bias and c[i] > rng_hi:
-                    candidates.append((1, c[i], l[i] - p.sl_pad_atr * A))
-                # SHORT : biais baissier + clôture sous le range
-                if bear_bias and c[i] < rng_lo and not p.long_only:
-                    candidates.append((-1, c[i], h[i] + p.sl_pad_atr * A))
-
-                for dr, entry_px, sl_px in candidates:
-                    if len(positions) >= p.max_positions:
-                        info["rejected_max_pos"] += 1
-                        continue
-                    dist = abs(entry_px - sl_px)
-                    # Bornes ATR
-                    dist = min(max(dist, p.sl_min_atr * A), p.sl_max_atr * A)
-                    if dist <= 0 or not np.isfinite(dist):
-                        continue
-                    if p.spread > p.max_spread_ratio * dist:
-                        info["rejected_spread"] += 1
-                        continue
-                    same_dir = [q for q in positions if q["dir"] == dr]
-                    if same_dir:
-                        info["rejected_same_dir"] += 1
-                        continue
-                    risk_money = max(equity, 0.0) * p.risk / 100.0
-                    if risk_money <= 0:
-                        continue
-                    if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
-                        info["rejected_max_risk"] += 1
-                        continue
-                    entry = entry_px + dr * (half_spread + slip)
-                    stop = entry - dr * dist
-                    tp = entry + dr * dist * p.rr
-                    positions.append({
-                        "dir": dr, "entry": entry, "stop": stop, "tp": tp,
-                        "dist": dist, "size": risk_money / dist,
-                        "risk_money": risk_money, "entry_time": times[i], "entry_i": i,
+                if bear_break and not p.short_only:
+                    sl_dist = rng_lo - p.sl_pad_atr * A
+                    sl_dist = min(max(abs(poc - sl_dist), p.sl_min_atr * A), p.sl_max_atr * A)
+                    sl_px = poc - sl_dist
+                    tp_px = rng_hi if p.tp_mode == "opposite" else poc + p.rr * sl_dist
+                    pending_orders.append({
+                        "dir": 1, "poc": poc, "dist": sl_dist,
+                        "stop": sl_px, "tp": tp_px,
+                        "placed_i": i, "rng_hi": rng_hi, "rng_lo": rng_lo,
                     })
-                    if dr == 1:
-                        info["signals_long"] += 1
-                    else:
-                        info["signals_short"] += 1
+                    info["orders_placed"] += 1
+
+                if bull_break and not p.long_only:
+                    sl_dist = rng_hi + p.sl_pad_atr * A
+                    sl_dist = min(max(abs(sl_dist - poc), p.sl_min_atr * A), p.sl_max_atr * A)
+                    sl_px = poc + sl_dist
+                    tp_px = rng_lo if p.tp_mode == "opposite" else poc - p.rr * sl_dist
+                    pending_orders.append({
+                        "dir": -1, "poc": poc, "dist": sl_dist,
+                        "stop": sl_px, "tp": tp_px,
+                        "placed_i": i, "rng_hi": rng_hi, "rng_lo": rng_lo,
+                    })
+                    info["orders_placed"] += 1
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
         curve[i] = equity + open_pnl
@@ -298,9 +348,6 @@ def run_momentum(df, p, start_idx=0):
     return trade_df, curve_series, info, pd.DataFrame(daily_rows)
 
 
-# ------------------------------------------------------------------------------
-# Métriques / rapport
-# ------------------------------------------------------------------------------
 def metrics(trades, curve, capital, start_time=None):
     if start_time is not None and len(curve):
         curve = curve[curve.index >= start_time]
@@ -354,8 +401,12 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
         print("Aucun trade.")
         return
     print(f"Jours             : {m.get('days', 0)}")
-    print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour")
+    print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour)")
     print(f"Longs/shorts      : {info.get('signals_long', 0)}/{info.get('signals_short', 0)}")
+    print(f"Ordres placés     : {info.get('orders_placed', 0)}")
+    print(f"  remplis         : {info.get('orders_filled', 0)}")
+    print(f"  expirés         : {info.get('orders_expired', 0)}")
+    print(f"  annulés         : {info.get('orders_cancelled', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
     print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
@@ -366,94 +417,100 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}")
     print(f"Rejets (range)    : {info.get('rejected_range', 0)}")
     print(f"Rejets (spread)   : {info.get('rejected_spread', 0)}")
-    print(f"Rejets (même sens): {info.get('rejected_same_dir', 0)}")
     print(f"Sorties           : {m.get('reasons', {})}")
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %")
     if show_concentration:
         cs = concentration_stats(trades, daily)
         print("--- CONCENTRATION ---")
-        print(f"Top 1 trade  : {cs.get('top1_share', np.nan):.1f} % du PnL en R")
-        print(f"Top 5 trades : {cs.get('top5_share', np.nan):.1f} % du PnL en R")
-        print(f"Top 10 trades: {cs.get('top10_share', np.nan):.1f} % du PnL en R")
+        print(f"Top 1 trade  : {cs.get('top1_share', np.nan):.1f} % du PnL")
+        print(f"Top 5 trades : {cs.get('top5_share', np.nan):.1f} % du PnL")
+        print(f"Top 10 trades: {cs.get('top10_share', np.nan):.1f} % du PnL")
         print(f"Meilleur jour: {cs.get('best_day', 0):+.2f} %; part: {cs.get('best_day_share', np.nan):.1f} %")
 
 
 def report(symbol, df, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS MOMENTUM V9 | {symbol} {TIMEFRAME} | {len(df)} bougies")
+    print(f"# ARKAS RANGE POC V10 | {symbol} {TIMEFRAME} | {len(df)} bougies")
     print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}")
-    print(f"# EMA {p.ema_fast}/{p.ema_slow} | range {p.lookback_bars} bars | RR {p.rr} | "
-          f"spread {p.spread} | risque {p.risk}%")
-    print(f"# ATTENTION: simulation OHLC, aucun ordre réel.")
+    print(f"# Range {p.lookback_bars} bars | POC {p.poc_ratio} | "
+          f"ordre valide {p.limit_valid_bars} bars | SL pad {p.sl_pad_atr}ATR | "
+          f"TP {p.tp_mode} | spread {p.spread} | risque {p.risk}%")
+    print("# ATTENTION: simulation OHLC, aucun ordre réel.")
     print("#" * 64)
     if len(df) < 2000:
-        print("Historique insuffisant (< 2000 bougies H1).")
+        print("Historique insuffisant (< 2000 bougies).")
         return
-    if not 0.1 <= oos <= 0.5:
-        raise ValueError("La proportion OOS doit être entre 0.10 et 0.50.")
 
     bh = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100.0
 
-    # ===== Run principal =====
-    tr, cv, inf, dl = run_momentum(df, p)
+    tr, cv, inf, dl = run_range_poc(df, p)
     m = metrics(tr, cv, p.capital)
     show("PERIODE COMPLETE", m, inf, dl, tr, bh)
 
-    # ===== Run sans le meilleur jour =====
     cs = concentration_stats(tr, dl)
     best_day = cs.get("best_day_date")
     if best_day is not None and pd.notna(best_day):
         excluded_day = pd.Timestamp(best_day).normalize()
         p2 = make_params(exclude_days=[excluded_day])
-        tr2, cv2, inf2, dl2 = run_momentum(df, p2)
+        tr2, cv2, inf2, dl2 = run_range_poc(df, p2)
         m2 = metrics(tr2, cv2, p2.capital)
         show(f"SANS LE MEILLEUR JOUR ({excluded_day:%Y-%m-%d})", m2, inf2, dl2, tr2, bh, False)
 
-    # ===== Sensibilité spread =====
     print("\n=== SENSIBILITE SPREAD (net R | rend.% | DD% | n) ===")
-    for sp in (0.5, 1.0, 2.0, 4.0):
-        tr_s, cv_s, _, _ = run_momentum(df, make_params(spread=sp))
+    for sp in (0.10, 0.30, 0.50, 1.0):
+        tr_s, cv_s, _, _ = run_range_poc(df, make_params(spread=sp))
         m_s = metrics(tr_s, cv_s, p.capital)
         if m_s.get("n"):
-            print(f"spread {sp:.1f} : {m_s.get('exp', np.nan):+.3f}R | "
+            print(f"spread {sp:.2f} : {m_s.get('exp', np.nan):+.3f}R | "
                   f"{m_s.get('ret', np.nan):+.1f}% | DD {m_s.get('dd', np.nan):.1f}% | n={m_s['n']}")
         else:
-            print(f"spread {sp:.1f} : aucun trade")
-
-    # ===== Robustesse paramètres =====
-    print("\n=== ROBUSTESSE : RR (net R | rend.% | n) ===")
-    for rr in (1.5, 2.0, 2.5, 3.0, 4.0):
-        tr_r, cv_r, _, _ = run_momentum(df, make_params(rr=rr))
-        m_r = metrics(tr_r, cv_r, p.capital)
-        if m_r.get("n"):
-            print(f"RR {rr} : {m_r.get('exp', np.nan):+.3f}R | "
-                  f"{m_r.get('ret', np.nan):+.1f}% | n={m_r['n']}")
+            print(f"spread {sp:.2f} : aucun trade")
 
     print("\n=== ROBUSTESSE : lookback range (net R | rend.% | n) ===")
-    for lb in (6, 12, 18, 24):
-        tr_l, cv_l, _, _ = run_momentum(df, make_params(lookback_bars=lb))
+    for lb in (12, 24, 48, 96):
+        tr_l, cv_l, _, _ = run_range_poc(df, make_params(lookback_bars=lb))
         m_l = metrics(tr_l, cv_l, p.capital)
         if m_l.get("n"):
             print(f"LB {lb} : {m_l.get('exp', np.nan):+.3f}R | "
                   f"{m_l.get('ret', np.nan):+.1f}% | n={m_l['n']}")
 
-    print("\n=== ROBUSTESSE : EMA (net R | rend.% | n) ===")
-    for ef, es in ((10, 30), (20, 50), (30, 100)):
-        tr_e, cv_e, _, _ = run_momentum(df, make_params(ema_fast=ef, ema_slow=es))
-        m_e = metrics(tr_e, cv_e, p.capital)
-        if m_e.get("n"):
-            print(f"EMA {ef}/{es} : {m_e.get('exp', np.nan):+.3f}R | "
-                  f"{m_e.get('ret', np.nan):+.1f}% | n={m_e['n']}")
+    print("\n=== ROBUSTESSE : POC ratio (net R | rend.% | n) ===")
+    for pr in (0.382, 0.5, 0.618, 0.75):
+        tr_p, cv_p, _, _ = run_range_poc(df, make_params(poc_ratio=pr))
+        m_p = metrics(tr_p, cv_p, p.capital)
+        if m_p.get("n"):
+            print(f"POC {pr} : {m_p.get('exp', np.nan):+.3f}R | "
+                  f"{m_p.get('ret', np.nan):+.1f}% | n={m_p['n']}")
 
-    # ===== OOS chronologique =====
+    print("\n=== ROBUSTESSE : TP mode (net R | rend.% | n) ===")
+    for mode in ("opposite", "rr"):
+        for rr in ([None] if mode == "opposite" else [1.5, 2.0, 3.0]):
+            kw = {"tp_mode": mode}
+            if rr is not None:
+                kw["rr"] = rr
+            tr_t, cv_t, _, _ = run_range_poc(df, make_params(**kw))
+            m_t = metrics(tr_t, cv_t, p.capital)
+            if m_t.get("n"):
+                label = f"{mode}" + (f" RR{rr}" if rr else "")
+                print(f"{label} : {m_t.get('exp', np.nan):+.3f}R | "
+                      f"{m_t.get('ret', np.nan):+.1f}% | n={m_t['n']}")
+
+    print("\n=== ROBUSTESSE : validité ordre limite (net R | rend.% | n) ===")
+    for vb in (6, 12, 24, 48):
+        tr_v, cv_v, _, _ = run_range_poc(df, make_params(limit_valid_bars=vb))
+        m_v = metrics(tr_v, cv_v, p.capital)
+        if m_v.get("n"):
+            print(f"valid {vb} bars : {m_v.get('exp', np.nan):+.3f}R | "
+                  f"{m_v.get('ret', np.nan):+.1f}% | n={m_v['n']}")
+
     split = int(len(df) * (1.0 - oos))
     train_df = df.iloc[:split].reset_index(drop=True)
     test_df = df.iloc[split:].reset_index(drop=True)
     print(f"\n=== VALIDATION OOS CHRONOLOGIQUE ({100*oos:.0f}% final) ===")
     for label, part in (("TRAIN", train_df), ("OOS", test_df)):
-        tr_v, cv_v, inf_v, dl_v = run_momentum(part, p)
+        tr_v, cv_v, inf_v, dl_v = run_range_poc(part, p)
         m_v = metrics(tr_v, cv_v, p.capital)
         if m_v.get("n"):
             print(f"{label:5s}: trades={m_v['n']:4d} | exp={m_v.get('exp', np.nan):+.3f}R | "
@@ -462,19 +519,15 @@ def report(symbol, df, oos=0.30):
         else:
             print(f"{label:5s}: aucun trade exploitable")
 
-    print("\nLecture : viser espérance > +0,15 R sur les deux segments "
-          "ET stabilité sur les paramètres. Un edge momentum H1 doit apparaître sur train ET OOS.")
+    print("\nLecture : viser espérance > +0,10 R sur les DEUX segments ET stabilité sur les paramètres.")
 
 
-# ------------------------------------------------------------------------------
-# Service & main
-# ------------------------------------------------------------------------------
 async def health_server():
     port = int(os.getenv("PORT", "10000"))
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS MOMENTUM V9 backtest service OK - no live orders"
+            body = b"ARKAS RANGE POC V10 backtest service OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
