@@ -1,14 +1,13 @@
-"""ARKAS RANGE REJECT — V11 backtest only.
+"""ARKAS RANGE POC MULTI — V12 backtest only.
 No order-placement API is used. Simulations are candle-based, not tick-accurate.
-AUCUN ordre limite : entrée AU MARCHÉ au close de la bougie de rejet.
 
-Stratégie : Range Fade avec confirmation de rejet sur zone POC.
-  1. Range détecté sur N bougies (high/low).
+Stratégie : Range POC fade multi-symboles avec entrée directe dans la zone.
+  1. Range détecté sur N bougies.
   2. Cassure : clôture hors du range.
-  3. On attend le retour du prix dans la ZONE POC (POC ± tolérance ATR).
-  4. Confirmation : bougie de REJET (mèche longue + clôture inverse).
-  5. Entrée au CLOSE de la bougie de rejet (marché, pas de limite).
-  6. SL au-delà du bord cassé, TP au bord opposé.
+  3. Entrée DÈS que le prix entre dans la zone POC (pas d'attente de rejet).
+  4. SL au bord opposé, TP au bord opposé du range.
+  5. Trailing : à +1R -> SL à BE, puis trailing à 0.5 ATR du prix.
+  6. Max 3 positions simultanées, max 3 nouveaux trades par jour.
 """
 import argparse
 import asyncio
@@ -23,12 +22,14 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
+# Liste de symboles séparés par des virgules
+SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "EURGBP,EURCHF,AUDNZD,NZDUSD,USDCAD").split(",") if s.strip()]
 YEARS = float(os.getenv("BT_YEARS", "1.0"))
-SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
+SPREAD = float(os.getenv("BT_SPREAD", "0.0002"))   # spread forex ~2 pips
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
 TIMEFRAME = os.getenv("BT_TF", "15m")
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
+MAX_TRADES_PER_DAY = int(os.getenv("BT_MAX_TRADES_DAY", "3"))
 
 
 def log(msg):
@@ -39,9 +40,13 @@ async def fetch_history(account, symbol, timeframe, years):
     target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
     rows, start, prev_oldest = [], None, None
     while True:
-        batch = await account.get_historical_candles(
-            symbol=symbol, timeframe=timeframe, start_time=start, limit=1000
-        )
+        try:
+            batch = await account.get_historical_candles(
+                symbol=symbol, timeframe=timeframe, start_time=start, limit=1000
+            )
+        except Exception as e:
+            log(f"[{symbol}] fetch error: {type(e).__name__}: {e}")
+            return None
         if not batch:
             break
         batch = sorted(batch, key=lambda r: r["time"])
@@ -74,26 +79,28 @@ async def fetch_history(account, symbol, timeframe, years):
 
 def make_params(**over):
     p = argparse.Namespace(
-        spread=SPREAD, slippage=0.05, risk=RISK_PCT,
+        spread=SPREAD, slippage=0.0, risk=RISK_PCT,
         # Range
-        lookback_bars=96,             # M15 : 96 bars = 24h
+        lookback_bars=96,
         min_range_atr=1.0, max_range_atr=8.0,
         poc_ratio=0.5,
-        # Zone POC
         poc_zone_atr=0.25,
-        # Confirmation rejet
-        wick_body_min=1.5,
         break_timeout_bars=16,
         # SL/TP
         sl_pad_atr=0.5,
         sl_min_atr=1.0, sl_max_atr=4.0,
         tp_mode="opposite",
         rr=2.0,
+        # Trailing / BE
+        be_trigger_R=1.0,
+        trail_atr=0.5,
+        trail_start_R=1.0,
         # Gestion
         max_hold=48,
-        max_consec=2,
-        max_positions=1,
-        max_total_risk_pct=2.0,
+        max_positions=3,
+        max_trades_per_day=MAX_TRADES_PER_DAY,
+        max_total_risk_pct=3.0,
+        allow_same_dir=True,
         max_spread_ratio=0.15,
         atr=14,
         capital=INITIAL_CAPITAL,
@@ -106,29 +113,11 @@ def make_params(**over):
     return p
 
 
-def is_bullish_reject(o_i, h_i, l_i, c_i, wick_body_min):
-    body = abs(c_i - o_i)
-    rng = h_i - l_i
-    if rng <= 0 or c_i <= o_i:
-        return False
-    lower_wick = min(o_i, c_i) - l_i
-    if body < 1e-12:
-        return lower_wick > 0.7 * rng
-    return lower_wick >= wick_body_min * body
-
-
-def is_bearish_reject(o_i, h_i, l_i, c_i, wick_body_min):
-    body = abs(c_i - o_i)
-    rng = h_i - l_i
-    if rng <= 0 or c_i >= o_i:
-        return False
-    upper_wick = h_i - max(o_i, c_i)
-    if body < 1e-12:
-        return upper_wick > 0.7 * rng
-    return upper_wick >= wick_body_min * body
-
-
-def run_range_reject(df, p, start_idx=0):
+def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
+    """
+    Simule la stratégie sur un symbole.
+    global_state : dict partagé entre symboles pour la limite 3 trades/jour.
+    """
     d = df.reset_index(drop=True).copy()
     if len(d) < max(120, p.atr + 2):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
@@ -148,38 +137,38 @@ def run_range_reject(df, p, start_idx=0):
     positions, trades = [], []
     curve = np.full(n, np.nan)
     daily_rows = []
-
-    # Watch : après une cassure, on surveille le retour dans la zone POC
     watch = None
 
     excluded = set()
     if p.exclude_days:
         excluded = {np.datetime64(pd.Timestamp(x).normalize(), "D") for x in p.exclude_days}
 
+    # État partagé (limite 3 trades/jour tous symboles confondus)
+    if global_state is None:
+        global_state = {"trades_today": {}, "positions_total": 0}
+
     cur_day = None
-    day_open_equity = equity
-    day_halted = False
-    halt_reason = None
-    consec_losses = 0
 
     info = {
         "signals_long": 0, "signals_short": 0,
         "breaks_detected": 0, "breaks_timeout": 0,
-        "returns_to_zone": 0, "rejections_valid": 0, "rejections_invalid": 0,
+        "returns_to_zone": 0,
         "rejected_range": 0, "rejected_spread": 0,
         "rejected_max_pos": 0, "rejected_max_risk": 0,
+        "rejected_max_trades_day": 0, "rejected_global_pos": 0,
         "fills_stop_gap": 0, "fills_tp_gap": 0,
-        "days_consec_hit": 0,
+        "be_moves": 0, "trail_moves": 0,
     }
 
     def open_risk_pct():
         return sum(pos["risk_money"] for pos in positions) / p.capital * 100.0
 
     def close_position(pos, i, raw_fill, reason, gap_kind=None):
-        nonlocal equity, consec_losses, day_halted, halt_reason
+        nonlocal equity
         if pos not in positions:
             return
         positions.remove(pos)
+        global_state["positions_total"] = max(0, global_state["positions_total"] - 1)
         dr = pos["dir"]
         fill_raw = float(raw_fill)
         if gap_kind == "sl":
@@ -197,20 +186,17 @@ def run_range_reject(df, p, start_idx=0):
         pnl = (fill - pos["entry"]) * dr * pos["size"]
         equity += pnl
         trades.append({
+            "symbol": symbol,
             "entry_time": pd.Timestamp(pos["entry_time"]),
             "exit_time": pd.Timestamp(times[i]),
             "dir": "LONG" if dr == 1 else "SHORT", "entry": pos["entry"],
-            "exit": fill, "stop": pos["stop"], "tp": pos["tp"],
+            "exit": fill, "stop_initial": pos["stop_initial"],
+            "stop_final": pos["stop"], "tp": pos["tp"],
             "pnl": pnl, "R": pnl / pos["risk_money"] if pos["risk_money"] else 0.0,
             "cost_R": (p.spread + 2 * slip) / pos["dist"] if pos["dist"] else np.nan,
             "bars": i - pos["entry_i"] + 1, "reason": reason,
             "is_gap": gap_kind is not None,
         })
-        consec_losses = consec_losses + 1 if pnl <= 0 else 0
-        if consec_losses >= p.max_consec and not day_halted:
-            day_halted = True
-            halt_reason = f"{p.max_consec} pertes consécutives"
-            info["days_consec_hit"] += 1
 
     for i in range(n):
         day_key = np.datetime64(pd.Timestamp(day_values[i]).normalize(), "D")
@@ -219,35 +205,52 @@ def run_range_reject(df, p, start_idx=0):
                 daily_rows.append({
                     "date": pd.Timestamp(cur_day),
                     "ret_pct": (equity - day_open_equity) / p.capital * 100.0,
-                    "halt_reason": halt_reason,
                 })
             cur_day = day_values[i]
             day_open_equity = equity
-            day_halted = day_key in excluded
-            halt_reason = "jour exclu" if day_halted else None
-            consec_losses = 0
 
-        # ---- Gestion des positions ouvertes ----
+        # ---- Gestion des positions ouvertes avec trailing / BE ----
         for pos in list(positions):
             if i <= pos["entry_i"]:
                 continue
             dr = pos["dir"]
+            # Mise à jour du SL (BE puis trailing)
+            cur_price = c[i]
+            move_R = (cur_price - pos["entry"]) * dr / pos["dist"]
+            if move_R >= p.be_trigger_R and not pos["be_done"]:
+                pos["stop"] = pos["entry"]
+                pos["be_done"] = True
+                info["be_moves"] += 1
+            if move_R >= p.trail_start_R:
+                new_stop = cur_price - dr * p.trail_atr * atr[i]
+                if dr == 1 and new_stop > pos["stop"]:
+                    pos["stop"] = new_stop
+                    info["trail_moves"] += 1
+                elif dr == -1 and new_stop < pos["stop"]:
+                    pos["stop"] = new_stop
+                    info["trail_moves"] += 1
+
+            # Vérification SL/TP
             if dr == 1:
                 if o[i] <= pos["stop"]:
-                    close_position(pos, i, min(pos["stop"], o[i]), "stop (gap)", "sl")
+                    reason = "BE/trail (gap)" if pos["be_done"] or pos["stop"] > pos["stop_initial"] else "stop (gap)"
+                    close_position(pos, i, min(pos["stop"], o[i]), reason, "sl")
                 elif o[i] >= pos["tp"]:
                     close_position(pos, i, pos["tp"], "objectif (gap)", "tp")
                 elif l[i] <= pos["stop"]:
-                    close_position(pos, i, pos["stop"], "stop")
+                    reason = "BE/trail" if pos["be_done"] or pos["stop"] > pos["stop_initial"] else "stop"
+                    close_position(pos, i, pos["stop"], reason)
                 elif h[i] >= pos["tp"]:
                     close_position(pos, i, pos["tp"], "objectif")
             else:
                 if o[i] >= pos["stop"]:
-                    close_position(pos, i, max(pos["stop"], o[i]), "stop (gap)", "sl")
+                    reason = "BE/trail (gap)" if pos["be_done"] or pos["stop"] < pos["stop_initial"] else "stop (gap)"
+                    close_position(pos, i, max(pos["stop"], o[i]), reason, "sl")
                 elif o[i] <= pos["tp"]:
                     close_position(pos, i, pos["tp"], "objectif (gap)", "tp")
                 elif h[i] >= pos["stop"]:
-                    close_position(pos, i, pos["stop"], "stop")
+                    reason = "BE/trail" if pos["be_done"] or pos["stop"] < pos["stop_initial"] else "stop"
+                    close_position(pos, i, pos["stop"], reason)
                 elif l[i] <= pos["tp"]:
                     close_position(pos, i, pos["tp"], "objectif")
 
@@ -257,7 +260,7 @@ def run_range_reject(df, p, start_idx=0):
                 elif i + 1 >= n or weekdays[i + 1] >= 5:
                     close_position(pos, i, c[i], "fin de semaine")
 
-        # ---- Surveillance du retour dans la zone POC après une cassure ----
+        # ---- Surveillance : entrée directe dès que le prix entre dans la zone POC ----
         if watch is not None and len(positions) < p.max_positions:
             if i - watch["placed_i"] >= p.break_timeout_bars:
                 info["breaks_timeout"] += 1
@@ -268,51 +271,54 @@ def run_range_reject(df, p, start_idx=0):
                 price_in_zone = (l[i] <= zone_hi) and (h[i] >= zone_lo)
                 if price_in_zone:
                     info["returns_to_zone"] += 1
-                    if dr == 1:
-                        reject_ok = is_bullish_reject(o[i], h[i], l[i], c[i], p.wick_body_min)
+                    dist = watch["dist"]
+                    if p.spread > p.max_spread_ratio * dist:
+                        info["rejected_spread"] += 1
+                        watch = None
                     else:
-                        reject_ok = is_bearish_reject(o[i], h[i], l[i], c[i], p.wick_body_min)
-
-                    if reject_ok:
-                        info["rejections_valid"] += 1
-                        dist = watch["dist"]
-                        if p.spread > p.max_spread_ratio * dist:
-                            info["rejected_spread"] += 1
+                        risk_money = max(equity, 0.0) * p.risk / 100.0
+                        # Vérif risque total
+                        if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
+                            info["rejected_max_risk"] += 1
+                            watch = None
+                        # Vérif global positions (tous symboles)
+                        elif global_state["positions_total"] >= p.max_positions:
+                            info["rejected_global_pos"] += 1
+                            watch = None
+                        # Vérif limite trades/jour
+                        elif global_state["trades_today"].get(cur_day, 0) >= p.max_trades_per_day:
+                            info["rejected_max_trades_day"] += 1
                             watch = None
                         else:
-                            risk_money = max(equity, 0.0) * p.risk / 100.0
-                            if risk_money > 0 and open_risk_pct() + risk_money / p.capital * 100.0 <= p.max_total_risk_pct:
-                                # ENTRÉE AU MARCHÉ au close de la bougie de rejet
-                                entry = c[i] + dr * (half_spread + slip)
-                                sl_px = entry - dr * dist
-                                if watch["tp_mode"] == "opposite":
-                                    tp_px = watch["rng_hi"] if dr == 1 else watch["rng_lo"]
-                                else:
-                                    tp_px = entry + dr * dist * p.rr
-                                positions.append({
-                                    "dir": dr, "entry": entry,
-                                    "stop": sl_px, "tp": tp_px,
-                                    "dist": dist, "size": risk_money / dist,
-                                    "risk_money": risk_money,
-                                    "entry_time": times[i], "entry_i": i,
-                                })
-                                if dr == 1:
-                                    info["signals_long"] += 1
-                                else:
-                                    info["signals_short"] += 1
-                                watch = None
+                            # ENTRÉE AU MARCHÉ
+                            entry = c[i] + dr * (half_spread + slip)
+                            sl_px = entry - dr * dist
+                            if watch["tp_mode"] == "opposite":
+                                tp_px = watch["rng_hi"] if dr == 1 else watch["rng_lo"]
                             else:
-                                info["rejected_max_risk"] += 1
-                                watch = None
-                    else:
-                        info["rejections_invalid"] += 1
+                                tp_px = entry + dr * dist * p.rr
+                            positions.append({
+                                "dir": dr, "entry": entry,
+                                "stop": sl_px, "stop_initial": sl_px,
+                                "tp": tp_px, "dist": dist,
+                                "size": risk_money / dist,
+                                "risk_money": risk_money,
+                                "entry_time": times[i], "entry_i": i,
+                                "be_done": False,
+                            })
+                            global_state["positions_total"] += 1
+                            global_state["trades_today"][cur_day] = global_state["trades_today"].get(cur_day, 0) + 1
+                            if dr == 1:
+                                info["signals_long"] += 1
+                            else:
+                                info["signals_short"] += 1
+                            watch = None
 
-        # ---- Détection d'une cassure pour créer un watch ----
+        # ---- Détection cassure ----
         in_session = weekdays[i] < 5
-        can_watch = (not day_halted and in_session
-                     and i >= max(start_idx, p.lookback_bars)
-                     and i > 0 and np.isfinite(atr[i])
-                     and watch is None and len(positions) < p.max_positions)
+        can_watch = (in_session and i >= max(start_idx, p.lookback_bars)
+                     and i > 0 and np.isfinite(atr[i]) and watch is None
+                     and len(positions) < p.max_positions)
         if can_watch:
             A = atr[i]
             rng_hi = h[i - p.lookback_bars:i].max()
@@ -332,21 +338,16 @@ def run_range_reject(df, p, start_idx=0):
                 if bear_break and not p.short_only:
                     sl_dist = max(abs(poc - (rng_lo - p.sl_pad_atr * A)), 0.0)
                     sl_dist = min(max(sl_dist, p.sl_min_atr * A), p.sl_max_atr * A)
-                    watch = {
-                        "dir": 1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
-                        "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
-                        "placed_i": i, "tp_mode": p.tp_mode,
-                    }
+                    watch = {"dir": 1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
+                             "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
+                             "placed_i": i, "tp_mode": p.tp_mode}
                     info["breaks_detected"] += 1
-
                 elif bull_break and not p.long_only:
                     sl_dist = max(abs((rng_hi + p.sl_pad_atr * A) - poc), 0.0)
                     sl_dist = min(max(sl_dist, p.sl_min_atr * A), p.sl_max_atr * A)
-                    watch = {
-                        "dir": -1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
-                        "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
-                        "placed_i": i, "tp_mode": p.tp_mode,
-                    }
+                    watch = {"dir": -1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
+                             "rng_hi": rng_hi, "rng_lo": rng_lo, "dist": sl_dist,
+                             "placed_i": i, "tp_mode": p.tp_mode}
                     info["breaks_detected"] += 1
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
@@ -359,67 +360,67 @@ def run_range_reject(df, p, start_idx=0):
         daily_rows.append({
             "date": pd.Timestamp(cur_day),
             "ret_pct": (equity - day_open_equity) / p.capital * 100.0,
-            "halt_reason": halt_reason,
         })
     trade_df = pd.DataFrame(trades)
     curve_series = pd.Series(curve, index=pd.to_datetime(d["time"])).ffill()
     return trade_df, curve_series, info, pd.DataFrame(daily_rows)
 
 
-def metrics(trades, curve, capital, start_time=None):
-    if start_time is not None and len(curve):
-        curve = curve[curve.index >= start_time]
+# ------------------------------------------------------------------------------
+# Agrégation multi-symboles
+# ------------------------------------------------------------------------------
+def merge_results(results):
+    """results : liste de (symbol, trades_df, curve_s, info, daily_df)"""
+    all_trades = []
+    all_info = {}
+    for sym, tr, cv, inf, dl in results:
+        if tr is not None and len(tr):
+            all_trades.append(tr)
+        for k, v in inf.items():
+            all_info[k] = all_info.get(k, 0) + v
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    return trades, all_info
+
+
+def metrics_multi(trades, capital):
     out = {"n": len(trades)}
-    if len(curve) < 2:
+    if not len(trades):
         return out
-    base = float(curve.iloc[0]) if start_time is not None else float(capital)
-    out["ret"] = (float(curve.iloc[-1]) / base - 1.0) * 100.0 if base else np.nan
-    out["dd"] = ((curve / curve.cummax()) - 1.0).min() * 100.0
-    out["days"] = max((curve.index[-1] - curve.index[0]).days, 1)
-    if len(trades):
-        r = trades["R"].replace([np.inf, -np.inf], np.nan).dropna()
-        gp = r[r > 0].sum()
-        gl = -r[r <= 0].sum()
-        out["win"] = (r > 0).mean() * 100.0 if len(r) else 0.0
-        out["exp"] = r.mean() if len(r) else np.nan
-        out["exp_gross"] = (r + trades.loc[r.index, "cost_R"]).mean() if len(r) else np.nan
-        out["cost"] = trades["cost_R"].mean()
-        out["pf"] = gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0)
-        streak = best = 0
-        for value in r.to_numpy():
-            streak = streak + 1 if value <= 0 else 0
-            best = max(best, streak)
-        out["streak"] = best
-        out["bars"] = trades["bars"].mean()
-        out["reasons"] = trades["reason"].value_counts().to_dict()
+    # Reconstruire une equity curve globale à partir des PnL datés
+    t = trades.copy()
+    t["exit_time"] = pd.to_datetime(t["exit_time"])
+    t = t.sort_values("exit_time")
+    t["equity"] = capital + t["pnl"].cumsum()
+    t["peak"] = t["equity"].cummax()
+    t["dd"] = (t["equity"] / t["peak"] - 1.0) * 100.0
+    out["ret"] = (t["equity"].iloc[-1] / capital - 1.0) * 100.0
+    out["dd"] = t["dd"].min()
+    out["days"] = max((t["exit_time"].iloc[-1] - t["exit_time"].iloc[0]).days, 1)
+
+    r = t["R"].replace([np.inf, -np.inf], np.nan).dropna()
+    gp = r[r > 0].sum()
+    gl = -r[r <= 0].sum()
+    out["win"] = (r > 0).mean() * 100.0
+    out["exp"] = r.mean()
+    out["exp_gross"] = (r + t.loc[r.index, "cost_R"]).mean()
+    out["cost"] = t["cost_R"].mean()
+    out["pf"] = gp / gl if gl > 0 else float("inf")
+    streak = best = 0
+    for value in r.to_numpy():
+        streak = streak + 1 if value <= 0 else 0
+        best = max(best, streak)
+    out["streak"] = best
+    out["bars"] = t["bars"].mean()
+    out["reasons"] = t["reason"].value_counts().to_dict()
     return out
 
 
-def concentration_stats(trades, daily):
-    out = {}
-    if trades is not None and len(trades):
-        r = trades["R"].sort_values(ascending=False)
-        total = r.sum()
-        for k in (1, 5, 10):
-            out[f"top{k}_share"] = r.iloc[:k].sum() / total * 100.0 if total > 0 else np.nan
-        out["top1_R"] = r.iloc[0]
-    if daily is not None and len(daily):
-        daily = daily.copy()
-        daily["ret_pct"] = daily["ret_pct"].fillna(0.0)
-        total_ret = daily["ret_pct"].sum()
-        out["best_day"] = daily["ret_pct"].max()
-        out["best_day_share"] = daily["ret_pct"].max() / total_ret * 100.0 if abs(total_ret) > 1e-9 else np.nan
-        out["best_day_date"] = daily.loc[daily["ret_pct"].idxmax(), "date"]
-    return out
-
-
-def show(title, m, info, daily, trades, bh=None, show_concentration=True):
+def show_multi(title, m, info, trades, bh=None):
     print(f"\n=== {title} ===")
     if not m.get("n"):
         print("Aucun trade.")
         print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
         print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
-        print(f"  rejets valides  : {info.get('rejections_valid', 0)}")
         return
     print(f"Jours             : {m.get('days', 0)}")
     print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour)")
@@ -427,8 +428,10 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
     print(f"  timeouts        : {info.get('breaks_timeout', 0)}")
     print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
-    print(f"  rejets valides  : {info.get('rejections_valid', 0)}")
-    print(f"  rejets invalides: {info.get('rejections_invalid', 0)}")
+    print(f"  rejets max_pos  : {info.get('rejected_global_pos', 0)}")
+    print(f"  rejets max_jour : {info.get('rejected_max_trades_day', 0)}")
+    print(f"  BE moves        : {info.get('be_moves', 0)}")
+    print(f"  trailing moves  : {info.get('trail_moves', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
     print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
@@ -436,119 +439,124 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"Rendement         : {m.get('ret', float('nan')):+.1f} %")
     print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
     print(f"Pires pertes suite: {m.get('streak', 0)}")
-    print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}")
     print(f"Sorties           : {m.get('reasons', {})}")
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %")
-    if show_concentration:
-        cs = concentration_stats(trades, daily)
-        print("--- CONCENTRATION ---")
-        print(f"Top 1 trade  : {cs.get('top1_share', np.nan):.1f} % du PnL")
-        print(f"Top 5 trades : {cs.get('top5_share', np.nan):.1f} % du PnL")
-        print(f"Top 10 trades: {cs.get('top10_share', np.nan):.1f} % du PnL")
-        print(f"Meilleur jour: {cs.get('best_day', 0):+.2f} %; part: {cs.get('best_day_share', np.nan):.1f} %")
+    # Par symbole
+    if len(trades):
+        print("--- PAR SYMBOLE ---")
+        for sym, g in trades.groupby("symbol"):
+            r = g["R"]
+            print(f"  {sym:8s}: n={len(g):3d} | win={((r>0).mean()*100):5.1f}% | "
+                  f"exp={r.mean():+.3f}R | pnl={g['pnl'].sum():+.2f}")
 
 
-def report(symbol, df, oos=0.30):
+def report(symbols, dfs, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS RANGE REJECT V11 | {symbol} {TIMEFRAME} | {len(df)} bougies")
-    print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}")
-    print(f"# Range {p.lookback_bars} bars | POC {p.poc_ratio} | zone ±{p.poc_zone_atr}ATR | "
-          f"mèche/corps ≥ {p.wick_body_min} | timeout {p.break_timeout_bars} bars | "
-          f"TP {p.tp_mode} | spread {p.spread} | risque {p.risk}%")
-    print("# AUCUN ordre limite : entrée marché au close de la bougie de rejet.")
+    print(f"# ARKAS RANGE POC MULTI V12 | {len(symbols)} symboles | {TIMEFRAME}")
+    for s in symbols:
+        df = dfs.get(s)
+        if df is not None and len(df):
+            print(f"#   {s:8s} : {len(df)} bougies | {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d}")
+    print(f"# Range {p.lookback_bars} | zone ±{p.poc_zone_atr}ATR | BE {p.be_trigger_R}R | "
+          f"trail {p.trail_atr}ATR | max {p.max_positions} pos | {p.max_trades_per_day} trades/j")
+    print(f"# Entrée DIRECTE dans la zone POC (pas de bougie de rejet)")
+    print(f"# AUCUN ordre limite, entrée au marché.")
     print("#" * 64)
-    if len(df) < 2000:
-        print("Historique insuffisant (< 2000 bougies).")
-        return
 
-    bh = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100.0
+    # Run multi
+    global_state = {"trades_today": {}, "positions_total": 0}
+    results = []
+    for s in symbols:
+        df = dfs.get(s)
+        if df is None or not len(df):
+            continue
+        tr, cv, inf, dl = run_symbol(df, p, symbol=s, global_state=global_state)
+        results.append((s, tr, cv, inf, dl))
 
-    tr, cv, inf, dl = run_range_reject(df, p)
-    m = metrics(tr, cv, p.capital)
-    show("PERIODE COMPLETE", m, inf, dl, tr, bh)
+    trades, info = merge_results(results)
+    m = metrics_multi(trades, p.capital)
+    show_multi("PERIODE COMPLETE (MULTI)", m, info, trades)
 
     if m.get("n"):
-        cs = concentration_stats(tr, dl)
-        best_day = cs.get("best_day_date")
-        if best_day is not None and pd.notna(best_day):
-            excluded_day = pd.Timestamp(best_day).normalize()
-            p2 = make_params(exclude_days=[excluded_day])
-            tr2, cv2, inf2, dl2 = run_range_reject(df, p2)
-            m2 = metrics(tr2, cv2, p2.capital)
-            show(f"SANS LE MEILLEUR JOUR ({excluded_day:%Y-%m-%d})", m2, inf2, dl2, tr2, bh, False)
+        # Sans meilleur jour
+        trades_d = trades.copy()
+        trades_d["exit_time"] = pd.to_datetime(trades_d["exit_time"])
+        trades_d["day"] = trades_d["exit_time"].dt.normalize()
+        day_pnl = trades_d.groupby("day")["pnl"].sum().sort_values(ascending=False)
+        if len(day_pnl):
+            best_day = day_pnl.index[0]
+            t2 = trades_d[trades_d["day"] != best_day]
+            if len(t2):
+                m2 = metrics_multi(t2, p.capital)
+                show_multi(f"SANS LE MEILLEUR JOUR ({best_day:%Y-%m-%d})", m2, info, t2)
 
     print("\n=== SENSIBILITE SPREAD (net R | rend.% | DD% | n) ===")
-    for sp in (0.10, 0.30, 0.50, 1.0):
-        tr_s, cv_s, _, _ = run_range_reject(df, make_params(spread=sp))
-        m_s = metrics(tr_s, cv_s, p.capital)
-        if m_s.get("n"):
-            print(f"spread {sp:.2f} : {m_s.get('exp', np.nan):+.3f}R | "
-                  f"{m_s.get('ret', np.nan):+.1f}% | DD {m_s.get('dd', np.nan):.1f}% | n={m_s['n']}")
-        else:
-            print(f"spread {sp:.2f} : aucun trade")
-
-    print("\n=== ROBUSTESSE : mèche/corps minimum (net R | rend.% | n) ===")
-    for wb in (1.0, 1.5, 2.0, 3.0):
-        tr_w, cv_w, _, _ = run_range_reject(df, make_params(wick_body_min=wb))
-        m_w = metrics(tr_w, cv_w, p.capital)
-        if m_w.get("n"):
-            print(f"wick/body {wb} : {m_w.get('exp', np.nan):+.3f}R | "
-                  f"{m_w.get('ret', np.nan):+.1f}% | n={m_w['n']}")
-
-    print("\n=== ROBUSTESSE : zone POC (± ATR) (net R | rend.% | n) ===")
-    for pz in (0.15, 0.25, 0.50):
-        tr_z, cv_z, _, _ = run_range_reject(df, make_params(poc_zone_atr=pz))
-        m_z = metrics(tr_z, cv_z, p.capital)
-        if m_z.get("n"):
-            print(f"zone ±{pz} ATR : {m_z.get('exp', np.nan):+.3f}R | "
-                  f"{m_z.get('ret', np.nan):+.1f}% | n={m_z['n']}")
-
-    print("\n=== ROBUSTESSE : timeout retour (net R | rend.% | n) ===")
-    for tb in (8, 16, 32):
-        tr_t, cv_t, _, _ = run_range_reject(df, make_params(break_timeout_bars=tb))
-        m_t = metrics(tr_t, cv_t, p.capital)
-        if m_t.get("n"):
-            print(f"timeout {tb} : {m_t.get('exp', np.nan):+.3f}R | "
-                  f"{m_t.get('ret', np.nan):+.1f}% | n={m_t['n']}")
+    for sp in (0.0001, 0.0002, 0.0004, 0.0008):
+        global_state2 = {"trades_today": {}, "positions_total": 0}
+        results2 = []
+        for s in symbols:
+            df = dfs.get(s)
+            if df is None or not len(df):
+                continue
+            tr, cv, inf, dl = run_symbol(df, make_params(spread=sp), symbol=s, global_state=global_state2)
+            results2.append((s, tr, cv, inf, dl))
+        t2, _ = merge_results(results2)
+        m2 = metrics_multi(t2, p.capital)
+        if m2.get("n"):
+            print(f"spread {sp:.4f} : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | DD {m2.get('dd', np.nan):.1f}% | n={m2['n']}")
 
     print("\n=== ROBUSTESSE : lookback range (net R | rend.% | n) ===")
-    for lb in (48, 96, 192, 288):
-        tr_l, cv_l, _, _ = run_range_reject(df, make_params(lookback_bars=lb))
-        m_l = metrics(tr_l, cv_l, p.capital)
-        if m_l.get("n"):
-            print(f"LB {lb} : {m_l.get('exp', np.nan):+.3f}R | "
-                  f"{m_l.get('ret', np.nan):+.1f}% | n={m_l['n']}")
+    for lb in (48, 96, 192):
+        gs = {"trades_today": {}, "positions_total": 0}
+        r2 = []
+        for s in symbols:
+            df = dfs.get(s)
+            if df is None or not len(df):
+                continue
+            tr, cv, inf, dl = run_symbol(df, make_params(lookback_bars=lb), symbol=s, global_state=gs)
+            r2.append((s, tr, cv, inf, dl))
+        t2, _ = merge_results(r2)
+        m2 = metrics_multi(t2, p.capital)
+        if m2.get("n"):
+            print(f"LB {lb} : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    print("\n=== ROBUSTESSE : TP mode (net R | rend.% | n) ===")
-    for mode in ("opposite", "rr"):
-        for rr in ([None] if mode == "opposite" else [1.5, 2.0, 3.0]):
-            kw = {"tp_mode": mode}
-            if rr is not None:
-                kw["rr"] = rr
-            tr_tp, cv_tp, _, _ = run_range_reject(df, make_params(**kw))
-            m_tp = metrics(tr_tp, cv_tp, p.capital)
-            if m_tp.get("n"):
-                label = f"{mode}" + (f" RR{rr}" if rr else "")
-                print(f"{label} : {m_tp.get('exp', np.nan):+.3f}R | "
-                      f"{m_tp.get('ret', np.nan):+.1f}% | n={m_tp['n']}")
+    print("\n=== ROBUSTESSE : BE trigger (net R | rend.% | n) ===")
+    for be in (0.5, 1.0, 1.5, 2.0):
+        gs = {"trades_today": {}, "positions_total": 0}
+        r2 = []
+        for s in symbols:
+            df = dfs.get(s)
+            if df is None or not len(df):
+                continue
+            tr, cv, inf, dl = run_symbol(df, make_params(be_trigger_R=be), symbol=s, global_state=gs)
+            r2.append((s, tr, cv, inf, dl))
+        t2, _ = merge_results(r2)
+        m2 = metrics_multi(t2, p.capital)
+        if m2.get("n"):
+            print(f"BE {be}R : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    split = int(len(df) * (1.0 - oos))
-    train_df = df.iloc[:split].reset_index(drop=True)
-    test_df = df.iloc[split:].reset_index(drop=True)
-    print(f"\n=== VALIDATION OOS CHRONOLOGIQUE ({100*oos:.0f}% final) ===")
-    for label, part in (("TRAIN", train_df), ("OOS", test_df)):
-        tr_v, cv_v, inf_v, dl_v = run_range_reject(part, p)
-        m_v = metrics(tr_v, cv_v, p.capital)
-        if m_v.get("n"):
-            print(f"{label:5s}: trades={m_v['n']:4d} | exp={m_v.get('exp', np.nan):+.3f}R | "
-                  f"PF={m_v.get('pf', np.nan):.2f} | ret={m_v.get('ret', np.nan):+.1f}% | "
-                  f"DD={m_v.get('dd', np.nan):.1f}%")
-        else:
-            print(f"{label:5s}: aucun trade exploitable")
+    print("\n=== ROBUSTESSE : trailing ATR (net R | rend.% | n) ===")
+    for ta in (0.3, 0.5, 1.0):
+        gs = {"trades_today": {}, "positions_total": 0}
+        r2 = []
+        for s in symbols:
+            df = dfs.get(s)
+            if df is None or not len(df):
+                continue
+            tr, cv, inf, dl = run_symbol(df, make_params(trail_atr=ta), symbol=s, global_state=gs)
+            r2.append((s, tr, cv, inf, dl))
+        t2, _ = merge_results(r2)
+        m2 = metrics_multi(t2, p.capital)
+        if m2.get("n"):
+            print(f"trail {ta}ATR : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    print("\nLecture : viser espérance > +0,10 R sur les DEUX segments ET stabilité sur les paramètres.")
+    print("\nLecture : viser espérance > +0,10 R ET stabilité sur les paramètres.")
 
 
 async def health_server():
@@ -556,7 +564,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS RANGE REJECT V11 backtest OK - no live orders"
+            body = b"ARKAS RANGE MULTI V12 backtest OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -591,19 +599,28 @@ async def main():
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte MetaApi connecté. Lecture historique seulement: {SYMBOL} {TIMEFRAME} | {YEARS} an(s)")
-    try:
-        df = await fetch_history(account, SYMBOL, TIMEFRAME, YEARS)
-        if df is None or len(df) == 0:
-            print(f"[{SYMBOL}] Aucune bougie reçue.", flush=True)
-        else:
-            report(SYMBOL, df, oos=float(os.getenv("BT_OOS", "0.30")))
-    except Exception as exc:
-        log(f"Erreur backtest: {type(exc).__name__}: {exc}")
-    finally:
-        keepalive_task.cancel()
-        print("\nTERMINÉ. Aucun ordre n'a été passé.", flush=True)
-        await server_task
+    log(f"Compte MetaApi connecté. {len(SYMBOLS)} symboles : {SYMBOLS} | {TIMEFRAME}")
+
+    dfs = {}
+    for s in SYMBOLS:
+        try:
+            df = await fetch_history(account, s, TIMEFRAME, YEARS)
+            if df is not None and len(df) > 100:
+                dfs[s] = df
+                log(f"[{s}] {len(df)} bougies chargées")
+            else:
+                log(f"[{s}] données insuffisantes ou indisponibles")
+        except Exception as exc:
+            log(f"[{s}] erreur fetch: {type(exc).__name__}: {exc}")
+
+    if dfs:
+        report(list(dfs.keys()), dfs, oos=float(os.getenv("BT_OOS", "0.30")))
+    else:
+        print("Aucune donnée chargée.", flush=True)
+
+    keepalive_task.cancel()
+    print("\nTERMINÉ. Aucun ordre n'a été passé.", flush=True)
+    await server_task
 
 
 if __name__ == "__main__":
