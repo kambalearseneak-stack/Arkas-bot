@@ -15,9 +15,9 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOL = os.getenv("BT_SYMBOL", "NAS100")      # <-- NAS100 par défaut
+SYMBOL = os.getenv("BT_SYMBOL = US Tech 100")      # <-- US Tech 00 par défaut
 YEARS = float(os.getenv("BT_YEARS", "1.0"))     # 1 an pour avoir assez de bougies H1
-SPREAD = float(os.getenv("BT_SPREAD", "1.0"))   # NAS100 : ~1 point de spread
+SPREAD = float(os.getenv("BT_SPREAD", "1.0"))   # US Tech 100 : ~1 point de spread
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
 TIMEFRAME = "1h"                                 # <-- H1
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
