@@ -1,6 +1,6 @@
-"""ARKAS RANGE POC V13 — backtest only. AUCUN ordre réel.
-Multi-symboles : AUDNZD, EURGBP, XAUUSD.
-SL derrière le dernier swing (liquidité), TP = 1.5 x SL, BE à +1R, trailing 0.5 ATR.
+"""ARKAS TREND DONCHIAN V14 — backtest only. AUCUN ordre réel.
+Trend following par cassure de canal Donchian sur Daily.
+Famille Turtle Traders — edge documenté depuis 1980.
 """
 import argparse
 import asyncio
@@ -15,21 +15,22 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "AUDNZD,EURGBP,XAUUSD").split(",") if s.strip()]
-YEARS = float(os.getenv("BT_YEARS", "1.0"))
-SPREAD_OVERRIDES = {
-    "AUDNZD": 0.0002,
-    "EURGBP": 0.0002,
-    "XAUUSD": 0.30,
-    "EURCHF": 0.0002,
-    "NZDUSD": 0.0002,
-    "USDCAD": 0.0002,
-}
-DEFAULT_SPREAD = float(os.getenv("BT_SPREAD", "0.0002"))
+SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "XAUUSD,US500,EURUSD").split(",") if s.strip()]
+YEARS = float(os.getenv("BT_YEARS", "3.0"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = os.getenv("BT_TF", "15m")
+TIMEFRAME = "1d"
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
-MAX_TRADES_PER_DAY = int(os.getenv("BT_MAX_TRADES_DAY", "3"))
+MAX_TRADES_PER_DAY = 5
+
+SPREAD_OVERRIDES = {
+    "XAUUSD": 0.30,
+    "US500":  0.50,
+    "USTEC":  1.0,
+    "NAS100": 1.0,
+    "EURUSD": 0.0001,
+    "GBPUSD": 0.00015,
+    "USDJPY": 0.01,
+}
 
 
 def log(msg):
@@ -54,9 +55,9 @@ async def fetch_history(account, symbol, timeframe, years):
         oldest = batch[0]["time"]
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        if len(rows) % 5000 < 1000:
-            log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 120000:
+        if len(rows) % 500 < 100:
+            log(f"[{symbol}] {len(rows)} bougies D1; plus ancienne : {oldest:%Y-%m-%d}")
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 5000:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -78,76 +79,55 @@ async def fetch_history(account, symbol, timeframe, years):
 
 
 def get_spread(symbol):
-    return SPREAD_OVERRIDES.get(symbol.upper(), DEFAULT_SPREAD)
+    return SPREAD_OVERRIDES.get(symbol.upper(), 0.0002)
 
 
 def make_params(**over):
     p = argparse.Namespace(
-        spread=DEFAULT_SPREAD, slippage=0.0, risk=RISK_PCT,
-        lookback_bars=96,
-        min_range_atr=1.0, max_range_atr=8.0,
-        poc_ratio=0.5,
-        poc_zone_atr=0.25,
-        break_timeout_bars=16,
-        # SL/TP
-        swing_lookback=20,         # fenêtre pour trouver le dernier swing low/high
-        sl_pad_atr=0.3,            # marge au-delà du swing
-        sl_min_atr=1.0, sl_max_atr=4.0,
-        tp_R=1.5,                  # TP = 1.5 x distance SL
-        # Trailing / BE
-        be_trigger_R=1.0,
-        trail_atr=0.5,
-        trail_start_R=1.0,
+        slippage=0.0, risk=RISK_PCT,
+        # Donchian
+        entry_period=20,           # canal Donchian entrée
+        exit_period=10,            # canal Donchian sortie (trailing)
+        ema_filter=200,            # filtre tendance longue
+        use_ema_filter=True,
+        # Filtre ATR
+        min_atr_ratio=0.5,         # ATR courant >= 0.5 * ATR moyen
+        atr_period=20,
         # Gestion
-        max_hold=48,
+        max_hold=200,              # 200 jours max de tenue (sécurité)
         max_positions=3,
-        max_trades_per_day=MAX_TRADES_PER_DAY,
         max_total_risk_pct=3.0,
-        max_spread_ratio=0.15,
-        atr=14,
+        max_spread_ratio=0.05,     # spread <= 5% du risque initial
         capital=INITIAL_CAPITAL,
         long_only=False, short_only=False,
         exclude_days=None,
-        gap_slip_tp=0.25, gap_slip_sl=0.25,
+        gap_slip_sl=0.3, gap_slip_tp=0.3,
+        use_trailing=True,
     )
     for k, v in over.items():
         setattr(p, k, v)
     return p
 
 
-def find_recent_swing(h, l, i, direction, lookback):
-    """
-    direction=1  -> cherche le dernier swing LOW (bas) sur [i-lookback : i]
-    direction=-1 -> cherche le dernier swing HIGH (haut) sur [i-lookback : i]
-    """
-    lo0 = max(0, i - lookback)
-    if lo0 >= i:
-        return None
-    if direction == 1:
-        # Swing low local
-        seg = l[lo0:i]
-        if len(seg) == 0:
-            return None
-        idx = int(np.argmin(seg)) + lo0
-        return float(l[idx]), idx
-    else:
-        seg = h[lo0:i]
-        if len(seg) == 0:
-            return None
-        idx = int(np.argmax(seg)) + lo0
-        return float(h[idx]), idx
-
-
-def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
+def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
     d = df.reset_index(drop=True).copy()
-    if len(d) < max(120, p.atr + 2):
+    if len(d) < max(250, p.entry_period + p.ema_filter + 10):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
 
     o, h, l, c = (d[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
     n = len(d)
     prev_close = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_close), np.abs(l - prev_close)])
-    atr = pd.Series(tr).rolling(p.atr, min_periods=p.atr).mean().to_numpy()
+    atr = pd.Series(tr).rolling(p.atr_period, min_periods=p.atr_period).mean().to_numpy()
+    atr_avg = pd.Series(atr).rolling(100, min_periods=20).mean().to_numpy()
+    ema_long = pd.Series(c).ewm(span=p.ema_filter, adjust=False).mean().to_numpy()
+
+    # Canaux Donchian — décalés de 1 bougie pour ne pas utiliser la bougie courante
+    dc_hi_entry = pd.Series(h).rolling(p.entry_period).max().shift(1).to_numpy()
+    dc_lo_entry = pd.Series(l).rolling(p.entry_period).min().shift(1).to_numpy()
+    dc_hi_exit = pd.Series(h).rolling(p.exit_period).max().shift(1).to_numpy()
+    dc_lo_exit = pd.Series(l).rolling(p.exit_period).min().shift(1).to_numpy()
+
     times = d["time"].to_numpy()
     weekdays = d["time"].dt.weekday.to_numpy()
     day_values = d["time"].dt.normalize().to_numpy()
@@ -160,34 +140,30 @@ def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
     positions, trades = [], []
     curve = np.full(n, np.nan)
     daily_rows = []
-    watch = None
 
     excluded = set()
     if p.exclude_days:
         excluded = {np.datetime64(pd.Timestamp(x).normalize(), "D") for x in p.exclude_days}
 
     if global_state is None:
-        global_state = {"trades_today": {}, "positions_total": 0}
+        global_state = {"positions_total": 0, "trades_today": {}}
 
     cur_day = None
     day_open_equity = equity
 
     info = {
         "signals_long": 0, "signals_short": 0,
-        "breaks_detected": 0, "breaks_timeout": 0,
-        "returns_to_zone": 0,
-        "rejected_range": 0, "rejected_spread": 0,
-        "rejected_max_pos": 0, "rejected_max_risk": 0,
-        "rejected_max_trades_day": 0, "rejected_global_pos": 0,
-        "fills_stop_gap": 0, "fills_tp_gap": 0,
-        "be_moves": 0, "trail_moves": 0,
+        "rejected_no_break": 0, "rejected_ema": 0, "rejected_atr": 0,
+        "rejected_spread": 0, "rejected_max_pos": 0, "rejected_max_risk": 0,
+        "trail_moves": 0, "exit_by_trail": 0, "exit_by_timeout": 0,
+        "fills_stop_gap": 0,
     }
 
     def open_risk_pct():
         return sum(pos["risk_money"] for pos in positions) / p.capital * 100.0
 
     def close_position(pos, i, raw_fill, reason, gap_kind=None):
-        nonlocal equity
+        nonlocal equity, info
         if pos not in positions:
             return
         positions.remove(pos)
@@ -202,12 +178,10 @@ def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
                 fill_raw = max(fill_raw, float(o[i]))
                 fill_raw += p.gap_slip_sl * pos["dist"]
             info["fills_stop_gap"] += 1
-        elif gap_kind == "tp":
-            fill_raw -= dr * p.gap_slip_tp * pos["dist"]
-            info["fills_tp_gap"] += 1
         fill = fill_raw - dr * (half_spread + slip)
         pnl = (fill - pos["entry"]) * dr * pos["size"]
         equity += pnl
+        R = pnl / pos["risk_money"] if pos["risk_money"] else 0.0
         trades.append({
             "symbol": symbol,
             "entry_time": pd.Timestamp(pos["entry_time"]),
@@ -215,8 +189,7 @@ def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
             "dir": "LONG" if dr == 1 else "SHORT",
             "entry": pos["entry"], "exit": fill,
             "stop_initial": pos["stop_initial"], "stop_final": pos["stop"],
-            "tp": pos["tp"],
-            "pnl": pnl, "R": pnl / pos["risk_money"] if pos["risk_money"] else 0.0,
+            "pnl": pnl, "R": R,
             "cost_R": (spread + 2 * slip) / pos["dist"] if pos["dist"] else np.nan,
             "bars": i - pos["entry_i"] + 1, "reason": reason,
             "is_gap": gap_kind is not None,
@@ -233,166 +206,116 @@ def run_symbol(df, p, symbol="SYM", global_state=None, start_idx=0):
             cur_day = day_values[i]
             day_open_equity = equity
 
-        # ---- Gestion positions : BE, trailing, SL/TP ----
+        # ---- Gestion positions : trailing Donchian exit ----
         for pos in list(positions):
             if i <= pos["entry_i"]:
                 continue
             dr = pos["dir"]
-            cur_price = c[i]
-            move_R = (cur_price - pos["entry"]) * dr / pos["dist"]
 
-            # BE
-            if move_R >= p.be_trigger_R and not pos["be_done"]:
-                pos["stop"] = pos["entry"]
-                pos["be_done"] = True
-                info["be_moves"] += 1
+            # Mise à jour du SL avec le canal de sortie (trailing Donchian)
+            if p.use_trailing:
+                if dr == 1:
+                    new_stop = dc_lo_exit[i]
+                    if np.isfinite(new_stop) and new_stop > pos["stop"]:
+                        pos["stop"] = new_stop
+                        info["trail_moves"] += 1
+                else:
+                    new_stop = dc_hi_exit[i]
+                    if np.isfinite(new_stop) and new_stop < pos["stop"]:
+                        pos["stop"] = new_stop
+                        info["trail_moves"] += 1
 
-            # Trailing
-            if move_R >= p.trail_start_R:
-                new_stop = cur_price - dr * p.trail_atr * atr[i]
-                if dr == 1 and new_stop > pos["stop"]:
-                    pos["stop"] = new_stop
-                    info["trail_moves"] += 1
-                elif dr == -1 and new_stop < pos["stop"]:
-                    pos["stop"] = new_stop
-                    info["trail_moves"] += 1
-
+            # Vérif SL touché
             if dr == 1:
                 if o[i] <= pos["stop"]:
-                    reason = "BE/trail (gap)" if pos["be_done"] else "stop (gap)"
-                    close_position(pos, i, min(pos["stop"], o[i]), reason, "sl")
-                elif o[i] >= pos["tp"]:
-                    close_position(pos, i, pos["tp"], "objectif (gap)", "tp")
+                    close_position(pos, i, min(pos["stop"], o[i]), "trail (gap)", "sl")
+                    info["exit_by_trail"] += 1
                 elif l[i] <= pos["stop"]:
-                    reason = "BE/trail" if pos["be_done"] else "stop"
-                    close_position(pos, i, pos["stop"], reason)
-                elif h[i] >= pos["tp"]:
-                    close_position(pos, i, pos["tp"], "objectif")
+                    close_position(pos, i, pos["stop"], "trail")
+                    info["exit_by_trail"] += 1
             else:
                 if o[i] >= pos["stop"]:
-                    reason = "BE/trail (gap)" if pos["be_done"] else "stop (gap)"
-                    close_position(pos, i, max(pos["stop"], o[i]), reason, "sl")
-                elif o[i] <= pos["tp"]:
-                    close_position(pos, i, pos["tp"], "objectif (gap)", "tp")
+                    close_position(pos, i, max(pos["stop"], o[i]), "trail (gap)", "sl")
+                    info["exit_by_trail"] += 1
                 elif h[i] >= pos["stop"]:
-                    reason = "BE/trail" if pos["be_done"] else "stop"
-                    close_position(pos, i, pos["stop"], reason)
-                elif l[i] <= pos["tp"]:
-                    close_position(pos, i, pos["tp"], "objectif")
+                    close_position(pos, i, pos["stop"], "trail")
+                    info["exit_by_trail"] += 1
 
+            # Timeout
             if pos in positions:
                 if i - pos["entry_i"] + 1 >= p.max_hold:
                     close_position(pos, i, c[i], "temps")
-                elif i + 1 >= n or weekdays[i + 1] >= 5:
-                    close_position(pos, i, c[i], "fin de semaine")
+                    info["exit_by_timeout"] += 1
 
-        # ---- Surveillance retour zone POC ----
-        if watch is not None and len(positions) < p.max_positions:
-            if i - watch["placed_i"] >= p.break_timeout_bars:
-                info["breaks_timeout"] += 1
-                watch = None
+        # ---- Signaux Donchian ----
+        in_session = weekdays[i] < 5
+        can_trade = (in_session and i >= max(start_idx, p.entry_period + p.ema_filter + 5)
+                     and i > 0 and np.isfinite(atr[i]) and np.isfinite(atr_avg[i])
+                     and np.isfinite(dc_hi_entry[i]) and np.isfinite(dc_lo_entry[i])
+                     and len(positions) < p.max_positions)
+        if can_trade:
+            A = atr[i]
+            # Filtre ATR : volatilité minimale
+            atr_ok = A >= p.min_atr_ratio * atr_avg[i]
+            if not atr_ok:
+                info["rejected_atr"] += 1
             else:
-                dr = watch["dir"]
-                zone_lo, zone_hi = watch["zone_lo"], watch["zone_hi"]
-                price_in_zone = (l[i] <= zone_hi) and (h[i] >= zone_lo)
-                if price_in_zone:
-                    info["returns_to_zone"] += 1
+                # Filtre EMA long terme
+                ema_ok_long = (not p.use_ema_filter) or (c[i] > ema_long[i])
+                ema_ok_short = (not p.use_ema_filter) or (c[i] < ema_long[i])
 
-                    # ---- SL : derrière le dernier swing (liquidité) ----
-                    swing = find_recent_swing(h, l, i, direction=dr, lookback=p.swing_lookback)
-                    if swing is None:
-                        watch = None
-                        continue
-                    swing_price = swing[0]
-                    # SL sous le swing pour LONG, au-dessus pour SHORT
+                # Détection breakout
+                bull_break = c[i] > dc_hi_entry[i]
+                bear_break = c[i] < dc_lo_entry[i]
+
+                candidates = []
+                if bull_break and ema_ok_long and not p.short_only:
+                    candidates.append((1, dc_hi_entry[i]))
+                if bear_break and ema_ok_short and not p.long_only:
+                    candidates.append((-1, dc_lo_entry[i]))
+
+                for dr, trigger_px in candidates:
+                    # SL = canal Donchian exit (10 jours)
                     if dr == 1:
-                        sl_px_raw = swing_price - p.sl_pad_atr * atr[i]
+                        sl_px = dc_lo_exit[i]
                     else:
-                        sl_px_raw = swing_price + p.sl_pad_atr * atr[i]
-
-                    # Entrée au close actuel
-                    entry = c[i] + dr * (half_spread + slip)
-                    dist = abs(entry - sl_px_raw)
-                    # Bornes ATR
-                    A = atr[i]
-                    dist = min(max(dist, p.sl_min_atr * A), p.sl_max_atr * A)
-                    if dist <= 0:
-                        watch = None
+                        sl_px = dc_hi_exit[i]
+                    if not np.isfinite(sl_px):
                         continue
-                    sl_px = entry - dr * dist
-
+                    # Entry = close actuel + coûts
+                    entry = c[i] + dr * (half_spread + slip)
+                    dist = abs(entry - sl_px)
+                    if dist <= 0:
+                        continue
                     # Filtre spread
                     if spread > p.max_spread_ratio * dist:
                         info["rejected_spread"] += 1
-                        watch = None
                         continue
-
+                    # Cap taille
                     risk_money = max(equity, 0.0) * p.risk / 100.0
                     if risk_money <= 0:
-                        watch = None
                         continue
                     if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
                         info["rejected_max_risk"] += 1
-                        watch = None
                         continue
                     if global_state["positions_total"] >= p.max_positions:
-                        info["rejected_global_pos"] += 1
-                        watch = None
+                        info["rejected_max_pos"] += 1
                         continue
-                    if global_state["trades_today"].get(cur_day, 0) >= p.max_trades_per_day:
-                        info["rejected_max_trades_day"] += 1
-                        watch = None
-                        continue
-
-                    # ---- TP = 1.5 x distance SL ----
-                    tp_px = entry + dr * dist * p.tp_R
-
+                    # Open position
                     positions.append({
                         "dir": dr, "entry": entry,
                         "stop": sl_px, "stop_initial": sl_px,
-                        "tp": tp_px, "dist": dist,
+                        "dist": dist,
                         "size": risk_money / dist,
                         "risk_money": risk_money,
                         "entry_time": times[i], "entry_i": i,
-                        "be_done": False,
                     })
                     global_state["positions_total"] += 1
-                    global_state["trades_today"][cur_day] = global_state["trades_today"].get(cur_day, 0) + 1
                     if dr == 1:
                         info["signals_long"] += 1
                     else:
                         info["signals_short"] += 1
-                    watch = None
-
-        # ---- Détection cassure ----
-        in_session = weekdays[i] < 5
-        can_watch = (in_session and i >= max(start_idx, p.lookback_bars)
-                     and i > 0 and np.isfinite(atr[i]) and watch is None
-                     and len(positions) < p.max_positions)
-        if can_watch:
-            A = atr[i]
-            rng_hi = h[i - p.lookback_bars:i].max()
-            rng_lo = l[i - p.lookback_bars:i].min()
-            rng = rng_hi - rng_lo
-            valid_range = rng > 0 and p.min_range_atr * A <= rng <= p.max_range_atr * A
-            if not valid_range:
-                info["rejected_range"] += 1
-            else:
-                poc = rng_lo + p.poc_ratio * rng
-                zone_half = p.poc_zone_atr * A
-                zone_lo = poc - zone_half
-                zone_hi = poc + zone_half
-                bull_break = c[i] > rng_hi
-                bear_break = c[i] < rng_lo
-
-                if bear_break and not p.short_only:
-                    watch = {"dir": 1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
-                             "rng_hi": rng_hi, "rng_lo": rng_lo, "placed_i": i}
-                    info["breaks_detected"] += 1
-                elif bull_break and not p.long_only:
-                    watch = {"dir": -1, "poc": poc, "zone_lo": zone_lo, "zone_hi": zone_hi,
-                             "rng_hi": rng_hi, "rng_lo": rng_lo, "placed_i": i}
-                    info["breaks_detected"] += 1
+                    break  # un seul trade par symbole par jour
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
         curve[i] = equity + open_pnl
@@ -457,26 +380,23 @@ def show_multi(title, m, info, trades):
     print(f"\n=== {title} ===")
     if not m.get("n"):
         print("Aucun trade.")
-        print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
-        print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
+        print(f"  signaux rejetés (ATR) : {info.get('rejected_atr', 0)}")
         return
     print(f"Jours             : {m.get('days', 0)}")
-    print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour)")
+    print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1) * 365:.1f}/an)")
     print(f"Longs/shorts      : {info.get('signals_long', 0)}/{info.get('signals_short', 0)}")
-    print(f"  breaks détectés : {info.get('breaks_detected', 0)}")
-    print(f"  timeouts        : {info.get('breaks_timeout', 0)}")
-    print(f"  retours zone    : {info.get('returns_to_zone', 0)}")
-    print(f"  rejets max_pos  : {info.get('rejected_global_pos', 0)}")
-    print(f"  rejets max_jour : {info.get('rejected_max_trades_day', 0)}")
-    print(f"  BE moves        : {info.get('be_moves', 0)}")
     print(f"  trailing moves  : {info.get('trail_moves', 0)}")
+    print(f"  sorties trail   : {info.get('exit_by_trail', 0)}")
+    print(f"  sorties temps   : {info.get('exit_by_timeout', 0)}")
+    print(f"  rejets ATR      : {info.get('rejected_atr', 0)}")
+    print(f"  rejets spread   : {info.get('rejected_spread', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
-    print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
     print(f"Profit factor     : {m.get('pf', float('nan')):.2f}")
     print(f"Rendement         : {m.get('ret', float('nan')):+.1f} %")
     print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
     print(f"Pires pertes suite: {m.get('streak', 0)}")
+    print(f"Durée moyenne     : {m.get('bars', 0):.1f} bougies D1")
     print(f"Sorties           : {m.get('reasons', {})}")
     if len(trades):
         print("--- PAR SYMBOLE ---")
@@ -489,19 +409,19 @@ def show_multi(title, m, info, trades):
 def report(symbols, dfs, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS RANGE POC V13 | symboles : {symbols} | {TIMEFRAME}")
-    print(f"# SL derrière dernier swing | TP {p.tp_R}R | BE {p.be_trigger_R}R | "
-          f"trail {p.trail_atr}ATR | max {p.max_positions} pos | {p.max_trades_per_day} trades/j")
-    print(f"# AUCUN ordre réel. Simulation OHLC.")
+    print(f"# ARKAS TREND DONCHIAN V14 | symboles : {symbols} | {TIMEFRAME}")
+    print(f"# Entry DC {p.entry_period} | Exit DC {p.exit_period} | "
+          f"EMA {p.ema_filter} | ATR min {p.min_atr_ratio}x | risque {p.risk}%")
+    print(f"# AUCUN ordre réel. Simulation OHLC D1.")
     print("#" * 64)
 
-    global_state = {"trades_today": {}, "positions_total": 0}
+    global_state = {"positions_total": 0, "trades_today": {}}
     results = []
     for s in symbols:
         df = dfs.get(s)
         if df is None or not len(df):
             continue
-        tr, cv, inf, dl = run_symbol(df, p, symbol=s, global_state=global_state)
+        tr, cv, inf, dl = run_donchian(df, p, symbol=s, global_state=global_state)
         results.append((s, tr, cv, inf, dl))
 
     trades, info = merge_results(results)
@@ -509,7 +429,6 @@ def report(symbols, dfs, oos=0.30):
     show_multi("PERIODE COMPLETE (MULTI)", m, info, trades)
 
     if m.get("n"):
-        # Sans meilleur jour
         t_d = trades.copy()
         t_d["exit_time"] = pd.to_datetime(t_d["exit_time"])
         t_d["day"] = t_d["exit_time"].dt.normalize()
@@ -521,81 +440,87 @@ def report(symbols, dfs, oos=0.30):
                 m2 = metrics_multi(t2, p.capital)
                 show_multi(f"SANS LE MEILLEUR JOUR ({best_day:%Y-%m-%d})", m2, info, t2)
 
-    # Sensibilité spread
-    print("\n=== SENSIBILITE SPREAD (net R | rend.% | DD% | n) ===")
-    for mult in (0.5, 1.0, 2.0, 3.0):
-        gs = {"trades_today": {}, "positions_total": 0}
+    print("\n=== ROBUSTESSE : entry_period (net R | rend.% | n) ===")
+    for ep in (10, 20, 40, 60):
+        gs = {"positions_total": 0, "trades_today": {}}
         r2 = []
         for s in symbols:
             df = dfs.get(s)
             if df is None or not len(df):
                 continue
-            # On overrid le spread par symbole x mult
-            sp_base = get_spread(s)
-            old = SPREAD_OVERRIDES.get(s.upper(), DEFAULT_SPREAD)
-            SPREAD_OVERRIDES[s.upper()] = sp_base * mult
-            tr, cv, inf, dl = run_symbol(df, make_params(), symbol=s, global_state=gs)
-            SPREAD_OVERRIDES[s.upper()] = old
+            tr, cv, inf, dl = run_donchian(df, make_params(entry_period=ep), symbol=s, global_state=gs)
             r2.append((s, tr, cv, inf, dl))
         t2, _ = merge_results(r2)
         m2 = metrics_multi(t2, p.capital)
         if m2.get("n"):
-            print(f"spread x{mult} : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | DD {m2.get('dd', np.nan):.1f}% | n={m2['n']}")
-
-    # Robustesse TP
-    print("\n=== ROBUSTESSE : TP (R multiples) (net R | rend.% | n) ===")
-    for tpr in (1.0, 1.5, 2.0, 3.0):
-        gs = {"trades_today": {}, "positions_total": 0}
-        r2 = []
-        for s in symbols:
-            df = dfs.get(s)
-            if df is None or not len(df):
-                continue
-            tr, cv, inf, dl = run_symbol(df, make_params(tp_R=tpr), symbol=s, global_state=gs)
-            r2.append((s, tr, cv, inf, dl))
-        t2, _ = merge_results(r2)
-        m2 = metrics_multi(t2, p.capital)
-        if m2.get("n"):
-            print(f"TP {tpr}R : {m2.get('exp', np.nan):+.3f}R | "
+            print(f"DC {ep} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    # Robustesse BE
-    print("\n=== ROBUSTESSE : BE trigger (net R | rend.% | n) ===")
-    for be in (0.5, 1.0, 1.5, 2.0):
-        gs = {"trades_today": {}, "positions_total": 0}
+    print("\n=== ROBUSTESSE : exit_period (net R | rend.% | n) ===")
+    for xp in (5, 10, 20):
+        gs = {"positions_total": 0, "trades_today": {}}
         r2 = []
         for s in symbols:
             df = dfs.get(s)
             if df is None or not len(df):
                 continue
-            tr, cv, inf, dl = run_symbol(df, make_params(be_trigger_R=be), symbol=s, global_state=gs)
+            tr, cv, inf, dl = run_donchian(df, make_params(exit_period=xp), symbol=s, global_state=gs)
             r2.append((s, tr, cv, inf, dl))
         t2, _ = merge_results(r2)
         m2 = metrics_multi(t2, p.capital)
         if m2.get("n"):
-            print(f"BE {be}R : {m2.get('exp', np.nan):+.3f}R | "
+            print(f"Exit DC {xp} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    # Robustesse swing_lookback
-    print("\n=== ROBUSTESSE : swing lookback (net R | rend.% | n) ===")
-    for sw in (10, 20, 40):
-        gs = {"trades_today": {}, "positions_total": 0}
+    print("\n=== ROBUSTESSE : EMA filter (net R | rend.% | n) ===")
+    for ef in (100, 150, 200, 300):
+        gs = {"positions_total": 0, "trades_today": {}}
         r2 = []
         for s in symbols:
             df = dfs.get(s)
             if df is None or not len(df):
                 continue
-            tr, cv, inf, dl = run_symbol(df, make_params(swing_lookback=sw), symbol=s, global_state=gs)
+            tr, cv, inf, dl = run_donchian(df, make_params(ema_filter=ef), symbol=s, global_state=gs)
             r2.append((s, tr, cv, inf, dl))
         t2, _ = merge_results(r2)
         m2 = metrics_multi(t2, p.capital)
         if m2.get("n"):
-            print(f"swing {sw} : {m2.get('exp', np.nan):+.3f}R | "
+            print(f"EMA {ef} : {m2.get('exp', np.nan):+.3f}R | "
                   f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
 
-    print("\nLecture : viser espérance > +0,10 R, BE moves > 15% des trades, "
-          "stabilité sur les paramètres.", flush=True)
+    print("\n=== ROBUSTESSE : filtre ATR (net R | rend.% | n) ===")
+    for ar in (0.3, 0.5, 0.7, 1.0):
+        gs = {"positions_total": 0, "trades_today": {}}
+        r2 = []
+        for s in symbols:
+            df = dfs.get(s)
+            if df is None or not len(df):
+                continue
+            tr, cv, inf, dl = run_donchian(df, make_params(min_atr_ratio=ar), symbol=s, global_state=gs)
+            r2.append((s, tr, cv, inf, dl))
+        t2, _ = merge_results(r2)
+        m2 = metrics_multi(t2, p.capital)
+        if m2.get("n"):
+            print(f"ATR min {ar}x : {m2.get('exp', np.nan):+.3f}R | "
+                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
+
+    print("\n=== SANS filtre EMA (net R | rend.% | n) ===")
+    gs = {"positions_total": 0, "trades_today": {}}
+    r2 = []
+    for s in symbols:
+        df = dfs.get(s)
+        if df is None or not len(df):
+            continue
+        tr, cv, inf, dl = run_donchian(df, make_params(use_ema_filter=False), symbol=s, global_state=gs)
+        r2.append((s, tr, cv, inf, dl))
+    t2, _ = merge_results(r2)
+    m2 = metrics_multi(t2, p.capital)
+    if m2.get("n"):
+        print(f"Sans EMA : {m2.get('exp', np.nan):+.3f}R | "
+              f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
+
+    print("\nLecture : viser espérance > +0,10 R, PF > 1, stabilité sur DC/EMA/ATR.",
+          flush=True)
 
 
 async def health_server():
@@ -603,7 +528,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS V13 backtest OK - no live orders"
+            body = b"ARKAS TREND V14 backtest OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -644,11 +569,11 @@ async def main():
     for s in SYMBOLS:
         try:
             df = await fetch_history(account, s, TIMEFRAME, YEARS)
-            if df is not None and len(df) > 100:
+            if df is not None and len(df) > 250:
                 dfs[s] = df
-                log(f"[{s}] {len(df)} bougies chargées")
+                log(f"[{s}] {len(df)} bougies D1 chargées")
             else:
-                log(f"[{s}] données insuffisantes")
+                log(f"[{s}] données insuffisantes ({len(df) if df is not None else 0} bougies)")
         except Exception as exc:
             log(f"[{s}] erreur: {type(exc).__name__}: {exc}")
 
