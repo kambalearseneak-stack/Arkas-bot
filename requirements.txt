@@ -1,1 +1,3 @@
 metaapi-cloud-sdk
+   numpy
+   pandas
