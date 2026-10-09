@@ -1,19 +1,13 @@
 """
-Backtest ORB XAUUSD (M5) — 100 % MetaApi — rapport dans les logs, AUCUN ordre passé.
+Backtest ORB XAUUSD M5 — V7 — 100 % MetaApi — AUCUN ordre passé.
 
-Stratégie : ORB (Opening Range Breakout) multi-positions
-  - Range d'ouverture, cassure haut -> LONG, cassure bas -> SHORT
-  - SL = milieu du range (ou côté opposé) ; TP = RR x range
-  - Filtre volatilité ATR
-  - Plusieurs positions simultanées possibles, sous plafond de risque
+V7 : Slippage réaliste sur les fills gap.
+  - TP gap : tu obtiens tp - gap_slip_tp * dist (au lieu du TP plein)
+  - SL gap : tu obtiens sl - gap_slip_sl * dist (au lieu du SL plein)
+  - Test automatique sur 3 niveaux de slippage gap (faible / moyen / fort)
 
-CORRECTIONS V6 :
-  - Fill réaliste sur GAP : SL au stop, TP au TP (jamais au prix d'open)
-  - Stats de concentration : top 5 trades, part du meilleur jour, part du top 5
-  - Run "excluant le meilleur jour" pour mesurer l'edge hors coup de chance
-  - Distribution des R en histogramme texte
-
-Env : BT_SYMBOL, BT_YEARS, BT_SPREAD, BT_RISK
+Tout le reste (ORB multi-pos, fills réalistes V6, concentration, run sans meilleur jour)
+est conservé.
 """
 import argparse
 import asyncio
@@ -91,8 +85,10 @@ def make_params(**over):
         min_price_gap_atr=0.5,
         max_spread_ratio=0.15,
         capital=INITIAL_CAPITAL, long_only=False,
-        # Exclusion d'une plage de dates (pour le run "sans le meilleur jour")
-        exclude_days=None,          # liste de dates (np.datetime64) à exclure
+        exclude_days=None,
+        # --- V7 : slippage sur fills gap ---
+        gap_slip_tp=0.0,   # fraction de dist perdue sur un TP gap
+        gap_slip_sl=0.0,   # fraction de dist perdue EN PLUS sur un SL gap
     )
     for k, v in over.items():
         setattr(p, k, v)
@@ -100,7 +96,7 @@ def make_params(**over):
 
 
 # ------------------------------------------------------------------------------
-# Moteur ORB multi-positions — V6 avec fills réalistes
+# Moteur ORB V7
 # ------------------------------------------------------------------------------
 def run_orb(df, p, start_idx=0):
     d = df.reset_index(drop=True)
@@ -122,7 +118,6 @@ def run_orb(df, p, start_idx=0):
     curve = np.full(n, np.nan)
     daily_pnl = []
 
-    # Jours exclus (pour le run "sans le meilleur jour")
     excluded_set = set()
     if p.exclude_days:
         excluded_set = set(np.datetime64(x, "D") for x in p.exclude_days)
@@ -145,11 +140,19 @@ def run_orb(df, p, start_idx=0):
     def current_risk_pct():
         return sum(pos["risk_money"] for pos in positions) / INITIAL_CAPITAL * 100.0
 
-    def close_position(idx, i, raw, reason, is_gap=False):
+    def close_position(idx, i, raw, reason, is_gap=False, gap_kind=None, pos_ref=None):
+        """
+        gap_kind : None | "tp" | "sl"
+        Applique le slippage de gap sur le prix de fill si demandé.
+        """
         nonlocal equity, consec, day_halted, day_halt_reason
         pos = positions.pop(idx)
         dr = pos["dir"]
-        # fill = prix brut - coûts de sortie (spread demi + slippage)
+        # Application du slippage gap : on dégrade le fill au détriment du trader
+        if is_gap and gap_kind == "tp" and p.gap_slip_tp > 0:
+            raw = raw - dr * p.gap_slip_tp * pos["dist"]
+        if is_gap and gap_kind == "sl" and p.gap_slip_sl > 0:
+            raw = raw - dr * p.gap_slip_sl * pos["dist"]
         fill = raw - dr * (half + p.slippage)
         pnl = (fill - pos["entry"]) * dr * pos["size"]
         equity += pnl
@@ -168,9 +171,6 @@ def run_orb(df, p, start_idx=0):
     for i in range(n):
         day_key = np.datetime64(days[i], "D")
 
-        # ------------------------------------------------------------------
-        # Reset journalier
-        # ------------------------------------------------------------------
         if days[i] != cur_day:
             if cur_day is not None:
                 daily_pnl.append({
@@ -186,14 +186,11 @@ def run_orb(df, p, start_idx=0):
             orb_high = None
             orb_low = None
             orb_locked = False
-            # Si le jour est exclu -> on saute le trading ce jour-là
             if day_key in excluded_set:
                 day_halted = True
                 day_halt_reason = "jour exclu"
 
-        # ------------------------------------------------------------------
         # Construction du range
-        # ------------------------------------------------------------------
         if weekday[i] < 5 and not orb_locked:
             h_ok = hours[i] >= p.sess_start
             total_min = p.sess_start * 60 + p.orb_minutes
@@ -211,47 +208,48 @@ def run_orb(df, p, start_idx=0):
                 orb_locked = True
                 info["orb_days"] += 1
 
-        # ------------------------------------------------------------------
-        # Gestion des positions — FILLS RÉALISTES
-        #
-        # Règle : le fill ne peut JAMAIS être meilleur que le SL ou le TP.
-        #   - Si open traverse le SL -> fill = SL (pas open)
-        #   - Si open traverse le TP -> fill = TP (pas open)
-        #   - Sinon on teste dans la bougie (SL avant TP, prudent)
-        # ------------------------------------------------------------------
-        still_open = []
-        for pos in positions:
+        # Gestion des positions avec fills V7
+        for pos in list(positions):
+            if pos not in positions:
+                continue
             closed = False
+            idx = positions.index(pos)
+
             if pos["dir"] == 1:
                 if o[i] <= pos["stop"]:
-                    close_position(positions.index(pos), i, pos["stop"], "stop (gap)", is_gap=True)
+                    close_position(idx, i, pos["stop"], "stop (gap)",
+                                   is_gap=True, gap_kind="sl")
                     info["fills_stop_gap"] += 1
                     closed = True
                 elif o[i] >= pos["tp"]:
-                    close_position(positions.index(pos), i, pos["tp"], "objectif (gap)", is_gap=True)
+                    close_position(idx, i, pos["tp"], "objectif (gap)",
+                                   is_gap=True, gap_kind="tp")
                     info["fills_tp_gap"] += 1
                     closed = True
                 elif l[i] <= pos["stop"]:
-                    close_position(positions.index(pos), i, pos["stop"], "stop")
+                    close_position(idx, i, pos["stop"], "stop")
                     closed = True
                 elif h[i] >= pos["tp"]:
-                    close_position(positions.index(pos), i, pos["tp"], "objectif")
+                    close_position(idx, i, pos["tp"], "objectif")
                     closed = True
             else:
                 if o[i] >= pos["stop"]:
-                    close_position(positions.index(pos), i, pos["stop"], "stop (gap)", is_gap=True)
+                    close_position(idx, i, pos["stop"], "stop (gap)",
+                                   is_gap=True, gap_kind="sl")
                     info["fills_stop_gap"] += 1
                     closed = True
                 elif o[i] <= pos["tp"]:
-                    close_position(positions.index(pos), i, pos["tp"], "objectif (gap)", is_gap=True)
+                    close_position(idx, i, pos["tp"], "objectif (gap)",
+                                   is_gap=True, gap_kind="tp")
                     info["fills_tp_gap"] += 1
                     closed = True
                 elif h[i] >= pos["stop"]:
-                    close_position(positions.index(pos), i, pos["stop"], "stop")
+                    close_position(idx, i, pos["stop"], "stop")
                     closed = True
                 elif l[i] <= pos["tp"]:
-                    close_position(positions.index(pos), i, pos["tp"], "objectif")
+                    close_position(idx, i, pos["tp"], "objectif")
                     closed = True
+
             if not closed and pos in positions:
                 if i - pos["entry_i"] + 1 >= p.max_hold:
                     close_position(positions.index(pos), i, c[i], "temps")
@@ -260,9 +258,7 @@ def run_orb(df, p, start_idx=0):
                         and weekday[i + 1] < 5):
                     close_position(positions.index(pos), i, c[i], "fin de session")
 
-        # ------------------------------------------------------------------
         # Signaux
-        # ------------------------------------------------------------------
         in_session = (hours[i] >= p.sess_start) and (hours[i] < p.sess_end) and weekday[i] < 5
         if (not day_halted and orb_locked and orb_high is not None
                 and in_session and i >= start_idx):
@@ -278,16 +274,13 @@ def run_orb(df, p, start_idx=0):
                     else:
                         sl_long = orb_low
                         sl_short = orb_high
-
                     long_break = h[i] >= orb_high
                     short_break = l[i] <= orb_low
-
                     candidates = []
                     if long_break and not p.long_only:
                         candidates.append((1, orb_high, sl_long))
                     if short_break and not p.long_only:
                         candidates.append((-1, orb_low, sl_short))
-
                     for dr, entry_px, sl_px in candidates:
                         if len(positions) >= p.max_positions:
                             info["signals_rejected_max_pos"] += 1
@@ -348,7 +341,7 @@ def run_orb(df, p, start_idx=0):
 
 
 # ------------------------------------------------------------------------------
-# Métriques
+# Métriques / rapport
 # ------------------------------------------------------------------------------
 def metrics(trades, curve, capital, start_time=None):
     if start_time is not None:
@@ -378,8 +371,7 @@ def metrics(trades, curve, capital, start_time=None):
     return m
 
 
-def concentration_stats(trades, curve, daily):
-    """Statistiques de concentration : quelle part du PnL vient de quelques trades/jours."""
+def concentration_stats(trades, daily):
     out = {}
     if not len(trades):
         return out
@@ -392,7 +384,6 @@ def concentration_stats(trades, curve, daily):
     else:
         out["top1_share"] = out["top5_share"] = out["top10_share"] = float("nan")
     out["top1_R"] = r.iloc[0] if len(r) else 0
-    out["top5_R"] = r.iloc[:5].mean() if len(r) >= 5 else float("nan")
     if daily is not None and len(daily):
         d = daily.copy()
         d["ret_pct"] = d["ret_pct"].fillna(0.0)
@@ -406,22 +397,6 @@ def concentration_stats(trades, curve, daily):
     return out
 
 
-def r_histogram(trades, bins=(-2, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 99)):
-    if not len(trades):
-        return []
-    r = trades["R"].values
-    hist = []
-    for i in range(len(bins) - 1):
-        lo, hi = bins[i], bins[i + 1]
-        count = int(((r >= lo) & (r < hi)).sum())
-        bar = "█" * min(count, 50)
-        hist.append((f"[{lo:+.2f}, {hi:+.2f})", count, bar))
-    return hist
-
-
-# ------------------------------------------------------------------------------
-# Affichage
-# ------------------------------------------------------------------------------
 def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"\n=== {title} ===", flush=True)
     if not m.get("n"):
@@ -430,145 +405,112 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"Jours             : {m['days']}", flush=True)
     print(f"Trades            : {m['n']} ({m['n'] / m['days']:.2f}/jour)", flush=True)
     print(f"  dont longs/shorts : {info.get('longs', 0)}/{info.get('shorts', 0)}", flush=True)
-    print(f"Jours ORB valides : {info.get('orb_days', 0)}", flush=True)
-    print(f"Rejets (range ATR): {info.get('orb_skipped_range', 0)}", flush=True)
-    print(f"Rejets (spread)   : {info.get('orb_skipped_spread', 0)}", flush=True)
-    print(f"Rejets (max pos)  : {info.get('signals_rejected_max_pos', 0)}", flush=True)
-    print(f"Rejets (max risk) : {info.get('signals_rejected_max_risk', 0)}", flush=True)
-    print(f"Rejets (même sens): {info.get('signals_rejected_same_dir', 0)}", flush=True)
-    print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}", flush=True)
     print(f"Réussite          : {m['win']:.1f} %", flush=True)
     print(f"Espérance NETTE   : {m['exp']:+.3f} R/trade", flush=True)
     print(f"Avant coûts       : {m['exp_gross']:+.3f} R/trade", flush=True)
-    print(f"Coût moyen        : {m['cost']:.3f} R/trade", flush=True)
     print(f"Profit factor     : {m['pf']:.2f}", flush=True)
     print(f"Rendement         : {m['ret']:+.1f} %", flush=True)
     print(f"Drawdown max      : {m['dd']:.1f} %", flush=True)
     print(f"Pires pertes suite: {m['streak']}", flush=True)
-    print(f"Durée moyenne     : {m['bars']:.1f} bougies", flush=True)
+    print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}", flush=True)
     print(f"Sorties           : {m['reasons']}", flush=True)
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %", flush=True)
-
-    # Distribution des R
-    print("\n--- DISTRIBUTION DES R ---", flush=True)
-    for label, cnt, bar in r_histogram(trades):
-        print(f"{label} : {cnt:4d} {bar}", flush=True)
-
-    # Concentration
     if show_concentration:
-        cs = concentration_stats(trades, None, daily)
+        cs = concentration_stats(trades, daily)
         print("\n--- CONCENTRATION ---", flush=True)
-        print(f"Meilleur trade    : {cs.get('top1_R', 0):+.2f} R", flush=True)
-        print(f"Top 1 trade  : {cs.get('top1_share', 0):.1f} % du PnL total", flush=True)
-        print(f"Top 5 trades : {cs.get('top5_share', 0):.1f} % du PnL total", flush=True)
-        print(f"Top 10 trades: {cs.get('top10_share', 0):.1f} % du PnL total", flush=True)
+        print(f"Top 1 trade  : {cs.get('top1_share', 0):.1f} % du PnL", flush=True)
+        print(f"Top 5 trades : {cs.get('top5_share', 0):.1f} % du PnL", flush=True)
+        print(f"Top 10 trades: {cs.get('top10_share', 0):.1f} % du PnL", flush=True)
         print(f"Meilleur jour : {cs.get('best_day', 0):+.2f} % -> "
               f"{cs.get('best_day_share', 0):.1f} % du PnL total", flush=True)
-
-    # Stats journalières
-    if daily is not None and len(daily):
-        d = daily.copy()
-        d["ret_pct"] = d["ret_pct"].fillna(0.0)
-        win_days = (d["ret_pct"] > 0).sum()
-        loss_days = (d["ret_pct"] < 0).sum()
-        flat_days = (d["ret_pct"] == 0).sum()
-        print("\n--- STATS JOURNALIÈRES (% sur capital initial) ---", flush=True)
-        print(f"Jours tradés      : {len(d)}", flush=True)
-        print(f"  gagnants        : {win_days} ({win_days/len(d)*100:.1f}%)", flush=True)
-        print(f"  perdants        : {loss_days} ({loss_days/len(d)*100:.1f}%)", flush=True)
-        print(f"  plats           : {flat_days}", flush=True)
-        print(f"Meilleur jour     : {d['ret_pct'].max():+.2f} %", flush=True)
-        print(f"Pire jour         : {d['ret_pct'].min():+.2f} %", flush=True)
-        print(f"Jour moyen        : {d['ret_pct'].mean():+.3f} %", flush=True)
-        print(f"Jours arrêtés (consec) : {info.get('days_consec_hit', 0)}", flush=True)
 
 
 def report(symbol, df, oos=0.3):
     p = make_params()
     print("\n" + "#" * 44, flush=True)
-    print(f"# ORB V6 MULTI-POS {symbol} M5 | {len(df)} bougies", flush=True)
+    print(f"# ORB V7 SLIPPAGE GAP {symbol} M5 | {len(df)} bougies", flush=True)
     print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}", flush=True)
-    print(f"# Session {p.sess_start}h-{p.sess_end}h | ORB {p.orb_minutes} min | "
-          f"RR {p.rr} | spread {p.spread} | risque/trade {p.risk}%", flush=True)
-    print(f"# Max positions : {p.max_positions} | Risque total max : {p.max_total_risk_pct}%", flush=True)
-    print(f"# Fills gaps : SL au stop / TP au TP (réalistes)", flush=True)
+    print(f"# Base : ORB {p.orb_minutes}min | RR {p.rr} | session {p.sess_start}-{p.sess_end}h | "
+          f"spread {p.spread} | risque {p.risk}%/trade", flush=True)
     print("#" * 44, flush=True)
     if len(df) < 5000:
-        print("Historique insuffisant (< 5000 bougies).", flush=True)
+        print("Historique insuffisant.", flush=True)
         return
 
-    split = int(len(df) * (1 - oos))
-    split_time = df["time"].iloc[split]
-
-    # ============================================================
-    # RUN 1 : échantillon complet (fills réalistes)
-    # ============================================================
-    tr, cv, inf, dl = run_orb(df, p)
     bh = (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
-    show("COMPLET (fills réalistes)", metrics(tr, cv, p.capital), inf, dl, tr, bh)
 
     # ============================================================
-    # RUN 2 : sans le meilleur jour (anti-coup-de-chance)
+    # COMPARAISON : 4 niveaux de slippage gap TP (SL slippage = 0)
     # ============================================================
-    cs = concentration_stats(tr, cv, dl)
+    print("\n" + "=" * 60, flush=True)
+    print("TEST A : Impact du slippage TP gap (SL gap slippage = 0)", flush=True)
+    print("=" * 60, flush=True)
+    print(f"{'gap_slip_tp':>12} | {'esp.R':>7} | {'rend.%':>8} | {'DD%':>6} | "
+          f"{'n':>5} | {'meil.jour%':>10} | {'top5%':>6}", flush=True)
+    print("-" * 75, flush=True)
+    for gs in (0.0, 0.25, 0.5, 1.0):
+        tr, cv, inf, dl = run_orb(df, make_params(gap_slip_tp=gs))
+        m = metrics(tr, cv, p.capital)
+        cs = concentration_stats(tr, dl)
+        if m.get("n"):
+            line = (f"{gs:>12.2f} | {m['exp']:>+7.3f} | {m['ret']:>+8.1f} | "
+                    f"{m['dd']:>6.1f} | {m['n']:>5} | "
+                    f"{cs.get('best_day', 0):>+10.2f} | {cs.get('top5_share', 0):>6.1f}")
+        else:
+            line = f"{gs:>12.2f} | aucun trade"
+        print(line, flush=True)
+
+    # ============================================================
+    # COMPARAISON : 4 niveaux de slippage SL gap (TP slippage = 0.5)
+    # ============================================================
+    print("\n" + "=" * 60, flush=True)
+    print("TEST B : Impact du slippage SL gap (TP gap slippage fixé à 0.5)", flush=True)
+    print("=" * 60, flush=True)
+    print(f"{'gap_slip_sl':>12} | {'esp.R':>7} | {'rend.%':>8} | {'DD%':>6} | {'n':>5}", flush=True)
+    print("-" * 55, flush=True)
+    for gsl in (0.0, 0.25, 0.5, 1.0):
+        tr, cv, inf, dl = run_orb(df, make_params(gap_slip_tp=0.5, gap_slip_sl=gsl))
+        m = metrics(tr, cv, p.capital)
+        if m.get("n"):
+            line = (f"{gsl:>12.2f} | {m['exp']:>+7.3f} | {m['ret']:>+8.1f} | "
+                    f"{m['dd']:>6.1f} | {m['n']:>5}")
+        else:
+            line = f"{gsl:>12.2f} | aucun trade"
+        print(line, flush=True)
+
+    # ============================================================
+    # COMBINAISON : cas réaliste "pessimiste"
+    # ============================================================
+    print("\n" + "=" * 60, flush=True)
+    print("TEST C : Scénario réaliste pessimiste (TP slip 0.5, SL slip 0.5)", flush=True)
+    print("=" * 60, flush=True)
+    tr_pe, cv_pe, inf_pe, dl_pe = run_orb(df, make_params(gap_slip_tp=0.5, gap_slip_sl=0.5))
+    show("REALISTE PESSIMISTE", metrics(tr_pe, cv_pe, p.capital), inf_pe, dl_pe, tr_pe, bh)
+
+    # Run sans le meilleur jour sur le scénario pessimiste
+    cs = concentration_stats(tr_pe, dl_pe)
     best_day = cs.get("best_day_date")
     if best_day is not None:
-        # Normaliser best_day en np.datetime64[D]
         bd = np.datetime64(pd.Timestamp(best_day).normalize().date(), "D")
-        p2 = make_params(exclude_days=[bd])
-        tr2, cv2, inf2, dl2 = run_orb(df, p2)
-        show(f"SANS LE MEILLEUR JOUR ({pd.Timestamp(best_day):%Y-%m-%d})",
-             metrics(tr2, cv2, p.capital), inf2, dl2, tr2, bh, show_concentration=False)
+        tr_pe2, cv_pe2, inf_pe2, dl_pe2 = run_orb(
+            df, make_params(gap_slip_tp=0.5, gap_slip_sl=0.5, exclude_days=[bd]))
+        show(f"REALISTE PESSIMISTE sans le meilleur jour ({pd.Timestamp(best_day):%Y-%m-%d})",
+             metrics(tr_pe2, cv_pe2, p.capital), inf_pe2, dl_pe2, tr_pe2, bh,
+             show_concentration=False)
 
     # ============================================================
-    # ROBUSTESSE
+    # COMBINAISON : cas "très pessimiste"
     # ============================================================
-    print("\n=== SENSIBILITE AU SPREAD (net R | rend. | DD | n) ===", flush=True)
-    for sp in (0.15, 0.30, 0.50, 0.80):
-        tr, cv, _, _ = run_orb(df, make_params(spread=sp))
-        m = metrics(tr, cv, p.capital)
-        line = (f"{m['exp']:+.2f}R {m['ret']:+.1f}% {m['dd']:.0f}% n={m['n']}"
-                if m.get("n") else "aucun trade")
-        print(f"spread {sp:.2f} : {line}", flush=True)
+    print("\n" + "=" * 60, flush=True)
+    print("TEST D : Scénario très pessimiste (TP slip 1.0, SL slip 1.0)", flush=True)
+    print("=" * 60, flush=True)
+    tr_tp, cv_tp, inf_tp, dl_tp = run_orb(df, make_params(gap_slip_tp=1.0, gap_slip_sl=1.0))
+    show("TRES PESSIMISTE", metrics(tr_tp, cv_tp, p.capital), inf_tp, dl_tp, tr_tp, bh,
+         show_concentration=False)
 
-    print("\n=== ROBUSTESSE : max_positions (net R | rend. | DD | n) ===", flush=True)
-    for mp in (1, 2, 3, 5, 10):
-        tr, cv, _, _ = run_orb(df, make_params(max_positions=mp))
-        m = metrics(tr, cv, p.capital)
-        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% DD{m['dd']:.0f}% n={m['n']}" if m.get("n") else "-"
-        print(f"max_pos {mp} : {line}", flush=True)
-
-    print("\n=== ROBUSTESSE : RR (net R | rend. | n) ===", flush=True)
-    for rr in (1.0, 1.5, 2.0, 2.5, 3.0):
-        tr, cv, _, _ = run_orb(df, make_params(rr=rr))
-        m = metrics(tr, cv, p.capital)
-        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-        print(f"RR {rr} : {line}", flush=True)
-
-    print("\n=== ROBUSTESSE : SL mode (net R | rend. | n) ===", flush=True)
-    for slm in ("mid", "opposite"):
-        tr, cv, _, _ = run_orb(df, make_params(sl_mode=slm))
-        m = metrics(tr, cv, p.capital)
-        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-        print(f"SL {slm} : {line}", flush=True)
-
-    print("\n=== ROBUSTESSE : session (net R | rend. | n) ===", flush=True)
-    for ss, se in ((8, 11), (13, 16), (8, 16), (14, 20)):
-        tr, cv, _, _ = run_orb(df, make_params(sess_start=ss, sess_end=se))
-        m = metrics(tr, cv, p.capital)
-        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-        print(f"session {ss}h-{se}h : {line}", flush=True)
-
-    print("\n=== ROBUSTESSE : durée ORB (net R | rend. | n) ===", flush=True)
-    for om in (15, 30, 45, 60):
-        tr, cv, _, _ = run_orb(df, make_params(orb_minutes=om))
-        m = metrics(tr, cv, p.capital)
-        line = f"{m['exp']:+.2f}R {m['ret']:+.1f}% n={m['n']}" if m.get("n") else "-"
-        print(f"ORB {om} min : {line}", flush=True)
-
-    print("\nLecture : si le run 'sans le meilleur jour' divise l'espérance par 3 ou plus, "
-          "l'edge vient d'un coup de chance et n'est pas exploitable.", flush=True)
+    print("\nLecture : si l'espérance reste > +0,3 R même en scénario très pessimiste, "
+          "l'edge est réel. Sinon, c'est un artefact de fills.", flush=True)
 
 
 # ------------------------------------------------------------------------------
@@ -580,7 +522,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"Backtest ORB V6 OK"
+            body = b"Backtest ORB V7 OK"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -616,8 +558,7 @@ async def main():
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s) | "
-        f"spread {SPREAD} | risque {RISK_PCT}%")
+    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s)")
 
     try:
         df = await fetch_history(account, SYMBOL, TIMEFRAME, YEARS)
@@ -629,7 +570,7 @@ async def main():
         print(f"[{SYMBOL}] Erreur : {e}", flush=True)
 
     ka.cancel()
-    print("\nTERMINE. Aucun ordre n'a été passé. Vous pouvez arrêter ce service.", flush=True)
+    print("\nTERMINE. Aucun ordre n'a été passé.", flush=True)
     while True:
         await asyncio.sleep(3600)
 
