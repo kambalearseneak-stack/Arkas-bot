@@ -26,7 +26,7 @@ MAX_POSITIONS = int(os.getenv("BT_MAX_POSITIONS", "2"))
 MAX_TOTAL_RISK_PCT = float(os.getenv("BT_MAX_TOTAL_RISK", "2.0"))
 MAX_HOLD_HOURS = int(os.getenv("BT_MAX_HOLD_HOURS", "48"))
 
-# Paramètres Donchian
+# Paramètres Donchian (identiques au backtest validé)
 ENTRY_PERIOD = 20
 EXIT_PERIOD = 10
 EMA_FILTER = 200
@@ -43,14 +43,14 @@ MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "15.0"))
 # SÉCURITÉS DURES — NON CONTOURNABLES
 # ============================================================
 HARD_LIMITS = {
-    "max_volume_per_order": 1.0,       # jamais > 1 lot par ordre
-    "max_position_value_usd": 5000,    # jamais > 5000$ notional
-    "max_orders_per_hour": 3,          # max 3 ordres/heure
-    "max_orders_per_day": 6,           # max 6 ordres/jour
-    "min_free_margin_pct": 50,         # toujours 50%+ de marge libre
+    "max_volume_per_order": 1.0,
+    "max_position_value_usd": 5000,
+    "max_orders_per_hour": 3,
+    "max_orders_per_day": 6,
+    "min_free_margin_pct": 50,
 }
 
-ORDER_LOG = deque(maxlen=50)  # {(timestamp, type)}
+ORDER_LOG = deque(maxlen=50)
 BOT_STATE = {
     "initial_equity": None,
     "peak_equity": None,
@@ -58,9 +58,7 @@ BOT_STATE = {
     "current_day": None,
     "halted": False,
     "halt_reason": None,
-    "last_processed_bar": None,
     "processed_bars": set(),
-    "first_equity_seen": None,
 }
 
 
@@ -79,27 +77,22 @@ def check_hard_limits(order_volume, notional_usd, account_info):
     """Vérifie les 6 sécurités dures. Retourne (ok, raison)."""
     now = datetime.now(timezone.utc)
 
-    # 1. Volume max
     if order_volume > HARD_LIMITS["max_volume_per_order"]:
         return False, f"volume {order_volume} > {HARD_LIMITS['max_volume_per_order']}"
 
-    # 2. Valeur notional max
     if notional_usd > HARD_LIMITS["max_position_value_usd"]:
         return False, f"notional {notional_usd:.0f}$ > {HARD_LIMITS['max_position_value_usd']}$"
 
-    # 3. Ordres par heure
     hour_ago = now - timedelta(hours=1)
     orders_last_hour = sum(1 for ts, _ in ORDER_LOG if ts > hour_ago)
     if orders_last_hour >= HARD_LIMITS["max_orders_per_hour"]:
         return False, f"{orders_last_hour} ordres dans l'heure >= {HARD_LIMITS['max_orders_per_hour']}"
 
-    # 4. Ordres par jour
     day_ago = now - timedelta(hours=24)
     orders_last_day = sum(1 for ts, _ in ORDER_LOG if ts > day_ago)
     if orders_last_day >= HARD_LIMITS["max_orders_per_day"]:
         return False, f"{orders_last_day} ordres dans la journée >= {HARD_LIMITS['max_orders_per_day']}"
 
-    # 5. Marge libre
     equity = account_info.get("equity", 0)
     margin_free = account_info.get("marginFree", equity)
     if equity > 0:
@@ -163,31 +156,37 @@ def check_signal(df, ind):
 
 
 # ============================================================
-# COMPTE
+# COMPTE (via connexion RPC)
 # ============================================================
-async def get_account_info(account):
-    info = await account.get_information()
-    return {
-        "balance": info.get("balance", 0),
-        "equity": info.get("equity", 0),
-        "marginFree": info.get("marginFree", info.get("freeMargin", 0)),
-        "margin": info.get("margin", 0),
-    }
-
-
-async def get_positions(account):
+async def get_account_info(rpc):
+    """Récupère balance, equity, marge via la connexion RPC."""
     try:
-        positions = await account.get_positions()
+        info = await rpc.get_account_information()
+        return {
+            "balance": float(info.get("balance", 0)),
+            "equity": float(info.get("equity", 0)),
+            "marginFree": float(info.get("freeMargin", info.get("marginFree", 0))),
+            "margin": float(info.get("margin", 0)),
+        }
+    except Exception as e:
+        log(f"Erreur get_account_info: {type(e).__name__}: {e}", "ERROR")
+        return {"balance": 0, "equity": 0, "marginFree": 0, "margin": 0}
+
+
+async def get_positions(rpc):
+    """Récupère les positions ouvertes via RPC."""
+    try:
+        positions = await rpc.get_positions()
         return [p for p in positions if p.get("symbol") == SYMBOL]
     except Exception as e:
-        log(f"Erreur get_positions: {e}", "ERROR")
+        log(f"Erreur get_positions: {type(e).__name__}: {e}", "ERROR")
         return []
 
 
 # ============================================================
 # EXÉCUTION
 # ============================================================
-async def open_position(account, signal, equity):
+async def open_position(rpc, signal, equity):
     dist = abs(signal["trigger"] - signal["sl"])
     if dist <= 0:
         log(f"Distance SL invalide: {dist}", "WARN")
@@ -195,40 +194,44 @@ async def open_position(account, signal, equity):
 
     risk_money = equity * RISK_PCT / 100.0
     size = risk_money / dist
-
-    # Arrondi selon le symbole (XAUUSD = 2 décimales, 0.01 lot min)
     size = round(size, 2)
+
     if size < 0.01:
         log(f"Taille trop petite ({size}), signal ignoré", "WARN")
         return None
 
     notional = size * signal["trigger"]
 
-    # ==== SÉCURITÉS DURES ====
-    acct = await get_account_info(account)
+    acct = await get_account_info(rpc)
     ok, reason = check_hard_limits(size, notional, acct)
     if not ok:
         log(f"🔒 ORDRE REFUSÉ par sécurité: {reason}", "SEC")
         return None
 
-    # Logique d'exécution
-    if signal["dir"] == 1:
-        log(f"🔵 OUVERTURE LONG : {size} lots @ marché, SL={signal['sl']:.2f}, "
-            f"risque={risk_money:.2f}$ (notional={notional:.0f}$)", "ORDER")
-    else:
-        log(f"🔴 OUVERTURE SHORT : {size} lots @ marché, SL={signal['sl']:.2f}, "
-            f"risque={risk_money:.2f}$ (notional={notional:.0f}$)", "ORDER")
+    if not LIVE_MODE:
+        log(f"[DRY_RUN] {'LONG' if signal['dir']==1 else 'SHORT'} {size} lots "
+            f"@ {signal['trigger']:.2f}, SL={signal['sl']:.2f}", "ORDER")
+        return f"dry-{datetime.now().timestamp()}"
 
     try:
         if signal["dir"] == 1:
-            result = await account.create_market_buy_order(
+            log(f"🔵 OUVERTURE LONG : {size} lots, SL={signal['sl']:.2f}, "
+                f"risque={risk_money:.2f}$", "ORDER")
+            result = await rpc.create_market_buy_order(
                 symbol=SYMBOL, volume=size, stop_loss=signal["sl"]
             )
         else:
-            result = await account.create_market_sell_order(
+            log(f"🔴 OUVERTURE SHORT : {size} lots, SL={signal['sl']:.2f}, "
+                f"risque={risk_money:.2f}$", "ORDER")
+            result = await rpc.create_market_sell_order(
                 symbol=SYMBOL, volume=size, stop_loss=signal["sl"]
             )
-        order_id = result.get("orderId") if isinstance(result, dict) else str(result)
+        # Extraire l'ID d'ordre
+        order_id = None
+        if isinstance(result, dict):
+            order_id = result.get("orderId") or result.get("positionId") or str(result)
+        else:
+            order_id = str(result)
         log(f"✅ Ordre exécuté : ID={order_id}", "ORDER")
         ORDER_LOG.append((datetime.now(timezone.utc), signal["dir"]))
         return order_id
@@ -237,19 +240,25 @@ async def open_position(account, signal, equity):
         return None
 
 
-async def update_stop_loss(account, position_id, new_sl):
+async def update_stop_loss(rpc, position_id, new_sl):
+    if not LIVE_MODE:
+        log(f"[DRY_RUN] SL {position_id} → {new_sl:.2f}", "TRAIL")
+        return True
     try:
-        await account.modify_position(position_id=position_id, stop_loss=new_sl)
-        log(f"SL modifié : position {position_id} → {new_sl:.2f}", "TRAIL")
+        await rpc.modify_position(position_id=position_id, stop_loss=new_sl)
+        log(f"SL modifié : {position_id} → {new_sl:.2f}", "TRAIL")
         return True
     except Exception as e:
         log(f"Échec modif SL: {type(e).__name__}: {e}", "ERROR")
         return False
 
 
-async def close_position(account, position_id, reason):
+async def close_position(rpc, position_id, reason):
+    if not LIVE_MODE:
+        log(f"[DRY_RUN] FERMETURE {position_id} ({reason})", "CLOSE")
+        return True
     try:
-        await account.close_position(position_id=position_id)
+        await rpc.close_position(position_id=position_id)
         log(f"Position fermée : {position_id} ({reason})", "CLOSE")
         return True
     except Exception as e:
@@ -260,9 +269,9 @@ async def close_position(account, position_id, reason):
 # ============================================================
 # BOUCLE
 # ============================================================
-async def fetch_candles(account):
+async def fetch_candles(rpc):
     try:
-        candles = await account.get_historical_candles(
+        candles = await rpc.get_historical_candles(
             symbol=SYMBOL, timeframe=TIMEFRAME, limit=300
         )
         if not candles:
@@ -291,15 +300,17 @@ def is_new_bar(df):
     return False
 
 
-async def process_bar(account, df):
+async def process_bar(rpc, df):
     ind = compute_indicators(df)
     last_closed_time = df["time"].iloc[-2]
     last_close = df["close"].iloc[-2]
 
-    # ==== 1. Gestion positions ====
-    positions = await get_positions(account)
+    # ==== 1. Gestion des positions ====
+    positions = await get_positions(rpc)
     for pos in positions:
         pos_id = pos.get("id") or pos.get("positionId")
+        if not pos_id:
+            continue
         pos_type = str(pos.get("type", "")).lower()
         dr = 1 if "buy" in pos_type or "long" in pos_type else -1
         current_sl = float(pos.get("stopLoss", 0)) if pos.get("stopLoss") else None
@@ -309,34 +320,36 @@ async def process_bar(account, df):
         new_sl = ind["dc_lo_exit"][-1] if dr == 1 else ind["dc_hi_exit"][-1]
         if np.isfinite(new_sl):
             if dr == 1 and (current_sl is None or new_sl > current_sl) and new_sl < last_close:
-                await update_stop_loss(account, pos_id, new_sl)
+                await update_stop_loss(rpc, pos_id, new_sl)
             elif dr == -1 and (current_sl is None or new_sl < current_sl) and new_sl > last_close:
-                await update_stop_loss(account, pos_id, new_sl)
+                await update_stop_loss(rpc, pos_id, new_sl)
 
         # B. Timeout
         if open_time:
-            open_dt = pd.to_datetime(open_time, utc=True).tz_localize(None)
-            hours_held = (datetime.now(timezone.utc) - open_dt).total_seconds() / 3600
-            if hours_held >= MAX_HOLD_HOURS:
-                await close_position(account, pos_id, f"timeout {hours_held:.1f}h")
+            try:
+                open_dt = pd.to_datetime(open_time, utc=True).tz_localize(None)
+                hours_held = (datetime.now(timezone.utc) - open_dt).total_seconds() / 3600
+                if hours_held >= MAX_HOLD_HOURS:
+                    await close_position(rpc, pos_id, f"timeout {hours_held:.1f}h")
+            except Exception:
+                pass
 
     # ==== 2. Nouveau signal ====
-    positions = await get_positions(account)
+    positions = await get_positions(rpc)
     if len(positions) >= MAX_POSITIONS:
         return
 
     signal = check_signal(df, ind)
     if signal:
-        log(f"SIGNAL {'LONG' if signal['dir'] == 1 else 'SHORT'} "
-            f"à {last_closed_time} | trigger={signal['trigger']:.2f} | SL={signal['sl']:.2f}",
-            "SIGNAL")
+        log(f"SIGNAL {'LONG' if signal['dir']==1 else 'SHORT'} à {last_closed_time} | "
+            f"trigger={signal['trigger']:.2f} | SL={signal['sl']:.2f}", "SIGNAL")
 
         if BOT_STATE["halted"]:
             log(f"Bot en pause : {BOT_STATE['halt_reason']}", "HALT")
             return
 
-        acct = await get_account_info(account)
-        await open_position(account, signal, acct["equity"])
+        acct = await get_account_info(rpc)
+        await open_position(rpc, signal, acct["equity"])
 
 
 # ============================================================
@@ -403,13 +416,17 @@ async def main():
     await account.wait_connected()
     log("✅ Compte MetaApi connecté")
 
-    info = await get_account_info(account)
+    # ==== Connexion RPC (créée une seule fois) ====
+    rpc = await account.get_rpc_connection()
+    await rpc.wait_connected()
+    log("✅ Connexion RPC prête")
+
+    info = await get_account_info(rpc)
     log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f} | "
         f"Marge libre : {info['marginFree']:.2f}")
     BOT_STATE["initial_equity"] = info["equity"]
     BOT_STATE["peak_equity"] = info["equity"]
     BOT_STATE["day_start_equity"] = info["equity"]
-    BOT_STATE["first_equity_seen"] = info["equity"]
 
     log(f"📡 Surveillance {SYMBOL} {TIMEFRAME} démarrée")
     log("Boucle : vérification toutes les 60 secondes")
@@ -419,16 +436,14 @@ async def main():
         try:
             await asyncio.sleep(60)
 
-            # Reset journalier
             today = datetime.now(timezone.utc).date()
             if BOT_STATE["current_day"] != today:
                 BOT_STATE["current_day"] = today
-                info = await get_account_info(account)
+                info = await get_account_info(rpc)
                 BOT_STATE["day_start_equity"] = info["equity"]
                 log(f"🌅 Nouveau jour. Equity début : {info['equity']:.2f}")
 
-            # Vérif limites
-            info = await get_account_info(account)
+            info = await get_account_info(rpc)
             current_equity = info["equity"]
             if current_equity > BOT_STATE["peak_equity"]:
                 BOT_STATE["peak_equity"] = current_equity
@@ -448,14 +463,14 @@ async def main():
             if BOT_STATE["halted"]:
                 continue
 
-            df = await fetch_candles(account)
+            df = await fetch_candles(rpc)
             if df is None:
                 continue
 
             if is_new_bar(df):
                 last_bar = df["time"].iloc[-2]
                 log(f"📊 Nouvelle bougie : {last_bar}")
-                await process_bar(account, df)
+                await process_bar(rpc, df)
 
         except asyncio.CancelledError:
             break
