@@ -1,5 +1,6 @@
-"""ARKAS ORB XAUUSD M5 — V8 backtest only.
+"""ARKAS MOMENTUM H1 — V9 backtest only.
 No order-placement API is used. Simulations are candle-based, not tick-accurate.
+Stratégie : momentum de tendance H1 sur indices (NAS100, US500, DAX...).
 """
 import argparse
 import asyncio
@@ -14,11 +15,11 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
-YEARS = float(os.getenv("BT_YEARS", "0.75"))
-SPREAD = float(os.getenv("BT_SPREAD", "0.30"))
+SYMBOL = os.getenv("BT_SYMBOL", "NAS100")      # <-- NAS100 par défaut
+YEARS = float(os.getenv("BT_YEARS", "1.0"))     # 1 an pour avoir assez de bougies H1
+SPREAD = float(os.getenv("BT_SPREAD", "1.0"))   # NAS100 : ~1 point de spread
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = "5m"
+TIMEFRAME = "1h"                                 # <-- H1
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
 
 
@@ -26,8 +27,10 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ------------------------------------------------------------------------------
+# Historique
+# ------------------------------------------------------------------------------
 async def fetch_history(account, symbol, timeframe, years):
-    """Download candles backwards; deduplicate and drop the last possibly-open candle."""
     target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
     rows, start, prev_oldest = [], None, None
     while True:
@@ -41,9 +44,9 @@ async def fetch_history(account, symbol, timeframe, years):
         oldest = batch[0]["time"]
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        if len(rows) % 5000 < 1000:
+        if len(rows) % 2000 < 1000:
             log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 120000:
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 30000:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -61,31 +64,43 @@ async def fetch_history(account, symbol, timeframe, years):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = (df.dropna(subset=["time", "open", "high", "low", "close"])
             .sort_values("time").drop_duplicates("time").reset_index(drop=True))
-    # Avoid keeping the most recent candle, which may not be closed yet.
     return df.iloc[:-1].reset_index(drop=True)
 
 
+# ------------------------------------------------------------------------------
+# Paramètres
+# ------------------------------------------------------------------------------
 def make_params(**over):
     p = argparse.Namespace(
-        spread=SPREAD, slippage=0.05, risk=RISK_PCT, rr=2.0, atr=14,
-        sess_start=8, sess_end=16, orb_minutes=30,
-        min_range_atr=0.3, max_range_atr=3.0,
-        sl_mode="mid", max_hold=96, max_consec=2,
-        max_positions=3, max_total_risk_pct=3.0,
-        allow_same_dir=True, min_price_gap_atr=0.5,
-        max_spread_ratio=0.15, capital=INITIAL_CAPITAL,
-        long_only=False, exclude_days=None,
-        gap_slip_tp=0.0, gap_slip_sl=0.0,
+        spread=SPREAD, slippage=0.5, risk=RISK_PCT, rr=2.5, atr=14,
+        ema_fast=20, ema_slow=50,          # biais H1
+        lookback_bars=12,                  # range de référence (12 bougies H1 = 12h)
+        min_range_atr=0.5, max_range_atr=5.0,
+        sl_pad_atr=0.3,                    # marge au-delà de la bougie de cassure
+        sl_min_atr=1.0, sl_max_atr=3.0,    # bornes du SL
+        max_hold=24,                       # 24 bougies H1 = 24h
+        max_consec=2,
+        max_positions=2,
+        max_total_risk_pct=2.0,
+        allow_same_dir=False,              # une position par sens
+        max_spread_ratio=0.15,
+        capital=INITIAL_CAPITAL,
+        long_only=False,
+        exclude_days=None,
+        gap_slip_tp=0.25,                  # NAS100 : gap plus rare mais possible
+        gap_slip_sl=0.25,
     )
     for k, v in over.items():
         setattr(p, k, v)
     return p
 
 
-def run_orb(df, p, start_idx=0):
-    """Candle-level ORB simulation. A new position is not stopped/targeted on its entry bar."""
+# ------------------------------------------------------------------------------
+# Moteur momentum H1
+# ------------------------------------------------------------------------------
+def run_momentum(df, p, start_idx=0):
     d = df.reset_index(drop=True).copy()
-    if len(d) < max(30, p.atr + 2):
+    if len(d) < max(60, p.atr + 2):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
 
     o, h, l, c = (d[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
@@ -93,17 +108,19 @@ def run_orb(df, p, start_idx=0):
     prev_close = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_close), np.abs(l - prev_close)])
     atr = pd.Series(tr).rolling(p.atr, min_periods=p.atr).mean().to_numpy()
+    ema_f = pd.Series(c).ewm(span=p.ema_fast, adjust=False).mean().to_numpy()
+    ema_s = pd.Series(c).ewm(span=p.ema_slow, adjust=False).mean().to_numpy()
     times = d["time"].to_numpy()
     hours = d["time"].dt.hour.to_numpy()
-    minutes = d["time"].dt.minute.to_numpy()
-    day_values = d["time"].dt.normalize().to_numpy()
     weekdays = d["time"].dt.weekday.to_numpy()
+    day_values = d["time"].dt.normalize().to_numpy()
     half_spread = max(float(p.spread), 0.0) / 2.0
     slip = max(float(p.slippage), 0.0)
     equity = float(p.capital)
     positions, trades = [], []
     curve = np.full(n, np.nan)
     daily_rows = []
+
     excluded = set()
     if p.exclude_days:
         excluded = {np.datetime64(pd.Timestamp(x).normalize(), "D") for x in p.exclude_days}
@@ -113,19 +130,15 @@ def run_orb(df, p, start_idx=0):
     day_halted = False
     halt_reason = None
     consec_losses = 0
-    orb_high = orb_low = None
-    orb_locked = False
-    orb_window_seen = False
+
     info = {
-        "orb_days": 0, "orb_skipped_range": 0, "orb_skipped_spread": 0,
-        "longs": 0, "shorts": 0, "days_consec_hit": 0,
-        "signals_rejected_max_pos": 0, "signals_rejected_max_risk": 0,
-        "signals_rejected_same_dir": 0, "fills_stop_gap": 0,
-        "fills_tp_gap": 0, "signals_rejected_entry_bar_ambiguity": 0,
+        "signals_long": 0, "signals_short": 0,
+        "rejected_range": 0, "rejected_spread": 0,
+        "rejected_max_pos": 0, "rejected_max_risk": 0,
+        "rejected_same_dir": 0, "fills_stop_gap": 0, "fills_tp_gap": 0,
     }
 
     def open_risk_pct():
-        # Risk is expressed as a fraction of current initial capital for a conservative cap.
         return sum(pos["risk_money"] for pos in positions) / p.capital * 100.0
 
     def close_position(pos, i, raw_fill, reason, gap_kind=None):
@@ -135,8 +148,6 @@ def run_orb(df, p, start_idx=0):
         positions.remove(pos)
         dr = pos["dir"]
         fill_raw = float(raw_fill)
-        # For stop gaps, use the observed opening price when it is worse than the stop.
-        # gap_slip_sl is an additional stress penalty measured in fractions of stop distance.
         if gap_kind == "sl":
             if dr == 1:
                 fill_raw = min(fill_raw, float(o[i]))
@@ -146,7 +157,6 @@ def run_orb(df, p, start_idx=0):
                 fill_raw += p.gap_slip_sl * pos["dist"]
             info["fills_stop_gap"] += 1
         elif gap_kind == "tp":
-            # TP gaps are not assumed to receive a better-than-limit fill; apply optional stress.
             fill_raw -= dr * p.gap_slip_tp * pos["dist"]
             info["fills_tp_gap"] += 1
         fill = fill_raw - dr * (half_spread + slip)
@@ -166,7 +176,7 @@ def run_orb(df, p, start_idx=0):
         if consec_losses >= p.max_consec and not day_halted:
             day_halted = True
             halt_reason = f"{p.max_consec} pertes consécutives"
-            info["days_consec_hit"] += 1
+            info["days_consec_hit"] = info.get("days_consec_hit", 0) + 1
 
     for i in range(n):
         day_key = np.datetime64(pd.Timestamp(day_values[i]).normalize(), "D")
@@ -182,25 +192,8 @@ def run_orb(df, p, start_idx=0):
             day_halted = day_key in excluded
             halt_reason = "jour exclu" if day_halted else None
             consec_losses = 0
-            orb_high = orb_low = None
-            orb_locked = False
-            orb_window_seen = False
 
-        # ORB window is defined in the candle timestamps' timezone (MetaApi server data).
-        if weekdays[i] < 5 and not orb_locked:
-            minute_of_day = int(hours[i]) * 60 + int(minutes[i])
-            orb_start = int(p.sess_start) * 60
-            orb_end = orb_start + int(p.orb_minutes)
-            if orb_start <= minute_of_day < orb_end:
-                orb_window_seen = True
-                orb_high = h[i] if orb_high is None else max(orb_high, h[i])
-                orb_low = l[i] if orb_low is None else min(orb_low, l[i])
-            elif minute_of_day >= orb_end and orb_window_seen and orb_high is not None:
-                orb_locked = True
-                info["orb_days"] += 1
-
-        # Manage only positions that existed before this candle. If SL and TP both touch
-        # during the same candle, choose the stop first (conservative OHLC assumption).
+        # ---- Gestion des positions ouvertes ----
         for pos in list(positions):
             if i <= pos["entry_i"]:
                 continue
@@ -227,58 +220,55 @@ def run_orb(df, p, start_idx=0):
             if pos in positions:
                 if i - pos["entry_i"] + 1 >= p.max_hold:
                     close_position(pos, i, c[i], "temps")
-                elif i + 1 >= n or not (
-                    p.sess_start <= hours[i + 1] < p.sess_end and weekdays[i + 1] < 5
-                ):
-                    close_position(pos, i, c[i], "fin de session")
+                elif i + 1 >= n or weekdays[i + 1] >= 5:
+                    close_position(pos, i, c[i], "fin de semaine")
 
-        in_session = p.sess_start <= hours[i] < p.sess_end and weekdays[i] < 5
-        if (not day_halted and orb_locked and orb_high is not None and in_session
-                and i >= start_idx and i > 0 and np.isfinite(atr[i])):
-            rng = orb_high - orb_low
+        # ---- Signal momentum ----
+        in_session = weekdays[i] < 5
+        if (not day_halted and in_session and i >= max(start_idx, p.lookback_bars)
+                and i > 0 and np.isfinite(atr[i])):
             A = atr[i]
+            rng_hi = h[i - p.lookback_bars:i].max()
+            rng_lo = l[i - p.lookback_bars:i].min()
+            rng = rng_hi - rng_lo
             valid_range = rng > 0 and p.min_range_atr * A <= rng <= p.max_range_atr * A
-            if valid_range:
-                if p.sl_mode == "mid":
-                    sl_long = sl_short = (orb_high + orb_low) / 2.0
-                else:
-                    sl_long, sl_short = orb_low, orb_high
-                # Breakout detected from the completed candle; use breakout level unless
-                # the candle opened beyond it, in which case use the opening price.
+            if not valid_range:
+                info["rejected_range"] += 1
+            else:
+                bull_bias = ema_f[i] > ema_s[i]
+                bear_bias = ema_f[i] < ema_s[i]
+
                 candidates = []
-                if h[i] >= orb_high:
-                    candidates.append((1, max(orb_high, o[i]), sl_long))
-                if l[i] <= orb_low and not p.long_only:
-                    candidates.append((-1, min(orb_low, o[i]), sl_short))
-                # If both boundaries are crossed in one M5 candle, path is unknowable:
-                # reject both signals rather than choose a favorable direction.
-                if h[i] >= orb_high and l[i] <= orb_low:
-                    info["signals_rejected_entry_bar_ambiguity"] += len(candidates)
-                    candidates = []
-                for dr, trigger_px, sl_px in candidates:
+                # LONG : biais haussier + clôture au-dessus du range
+                if bull_bias and c[i] > rng_hi:
+                    candidates.append((1, c[i], l[i] - p.sl_pad_atr * A))
+                # SHORT : biais baissier + clôture sous le range
+                if bear_bias and c[i] < rng_lo and not p.long_only:
+                    candidates.append((-1, c[i], h[i] + p.sl_pad_atr * A))
+
+                for dr, entry_px, sl_px in candidates:
                     if len(positions) >= p.max_positions:
-                        info["signals_rejected_max_pos"] += 1
+                        info["rejected_max_pos"] += 1
                         continue
-                    dist = abs(trigger_px - sl_px)
+                    dist = abs(entry_px - sl_px)
+                    # Bornes ATR
+                    dist = min(max(dist, p.sl_min_atr * A), p.sl_max_atr * A)
                     if dist <= 0 or not np.isfinite(dist):
                         continue
                     if p.spread > p.max_spread_ratio * dist:
-                        info["orb_skipped_spread"] += 1
+                        info["rejected_spread"] += 1
                         continue
                     same_dir = [q for q in positions if q["dir"] == dr]
                     if same_dir:
-                        if not p.allow_same_dir or any(
-                            abs(trigger_px - q["entry"]) < p.min_price_gap_atr * A for q in same_dir
-                        ):
-                            info["signals_rejected_same_dir"] += 1
-                            continue
+                        info["rejected_same_dir"] += 1
+                        continue
                     risk_money = max(equity, 0.0) * p.risk / 100.0
                     if risk_money <= 0:
                         continue
                     if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
-                        info["signals_rejected_max_risk"] += 1
+                        info["rejected_max_risk"] += 1
                         continue
-                    entry = trigger_px + dr * (half_spread + slip)
+                    entry = entry_px + dr * (half_spread + slip)
                     stop = entry - dr * dist
                     tp = entry + dr * dist * p.rr
                     positions.append({
@@ -286,14 +276,14 @@ def run_orb(df, p, start_idx=0):
                         "dist": dist, "size": risk_money / dist,
                         "risk_money": risk_money, "entry_time": times[i], "entry_i": i,
                     })
-                    info["longs" if dr == 1 else "shorts"] += 1
-            else:
-                info["orb_skipped_range"] += 1
+                    if dr == 1:
+                        info["signals_long"] += 1
+                    else:
+                        info["signals_short"] += 1
 
         open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
         curve[i] = equity + open_pnl
 
-    # Close any remaining positions at the final close, including normal exit costs.
     while positions:
         close_position(positions[0], n - 1, c[-1], "fin des données")
     curve[-1] = equity
@@ -308,6 +298,9 @@ def run_orb(df, p, start_idx=0):
     return trade_df, curve_series, info, pd.DataFrame(daily_rows)
 
 
+# ------------------------------------------------------------------------------
+# Métriques / rapport
+# ------------------------------------------------------------------------------
 def metrics(trades, curve, capital, start_time=None):
     if start_time is not None and len(curve):
         curve = curve[curve.index >= start_time]
@@ -362,7 +355,7 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
         return
     print(f"Jours             : {m.get('days', 0)}")
     print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1):.2f}/jour")
-    print(f"Longs/shorts      : {info.get('longs', 0)}/{info.get('shorts', 0)}")
+    print(f"Longs/shorts      : {info.get('signals_long', 0)}/{info.get('signals_short', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
     print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
@@ -371,6 +364,9 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
     print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
     print(f"Pires pertes suite: {m.get('streak', 0)}")
     print(f"Fills gap SL/TP   : {info.get('fills_stop_gap', 0)}/{info.get('fills_tp_gap', 0)}")
+    print(f"Rejets (range)    : {info.get('rejected_range', 0)}")
+    print(f"Rejets (spread)   : {info.get('rejected_spread', 0)}")
+    print(f"Rejets (même sens): {info.get('rejected_same_dir', 0)}")
     print(f"Sorties           : {m.get('reasons', {})}")
     if bh is not None:
         print(f"Buy & hold (réf.) : {bh:+.1f} %")
@@ -380,91 +376,107 @@ def show(title, m, info, daily, trades, bh=None, show_concentration=True):
         print(f"Top 1 trade  : {cs.get('top1_share', np.nan):.1f} % du PnL en R")
         print(f"Top 5 trades : {cs.get('top5_share', np.nan):.1f} % du PnL en R")
         print(f"Top 10 trades: {cs.get('top10_share', np.nan):.1f} % du PnL en R")
-        print(f"Meilleur jour: {cs.get('best_day', 0):+.2f} %; part du PnL journalier: {cs.get('best_day_share', np.nan):.1f} %")
-
-
-def run_scenario(df, title, gap_tp, gap_sl):
-    p = make_params(gap_slip_tp=gap_tp, gap_slip_sl=gap_sl)
-    trades, curve, info, daily = run_orb(df, p)
-    m = metrics(trades, curve, p.capital)
-    return p, trades, curve, info, daily, m
+        print(f"Meilleur jour: {cs.get('best_day', 0):+.2f} %; part: {cs.get('best_day_share', np.nan):.1f} %")
 
 
 def report(symbol, df, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS ORB V8 | {symbol} M5 | {len(df)} bougies")
+    print(f"# ARKAS MOMENTUM V9 | {symbol} {TIMEFRAME} | {len(df)} bougies")
     print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d %H:%M}")
-    print(f"# ORB {p.orb_minutes} min | RR {p.rr} | session {p.sess_start}-{p.sess_end} | spread {p.spread} | risque {p.risk}%")
-    print("# ATTENTION: simulation OHLC, sizing théorique; aucun ordre réel.")
+    print(f"# EMA {p.ema_fast}/{p.ema_slow} | range {p.lookback_bars} bars | RR {p.rr} | "
+          f"spread {p.spread} | risque {p.risk}%")
+    print(f"# ATTENTION: simulation OHLC, aucun ordre réel.")
     print("#" * 64)
-    if len(df) < 5000:
-        print("Historique insuffisant (< 5000 bougies).")
+    if len(df) < 2000:
+        print("Historique insuffisant (< 2000 bougies H1).")
         return
     if not 0.1 <= oos <= 0.5:
         raise ValueError("La proportion OOS doit être entre 0.10 et 0.50.")
 
     bh = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100.0
-    print("\nTEST A — slippage TP gap, SL gap = 0")
-    print(f"{'TP slip':>8} | {'Exp R':>8} | {'Rend.%':>8} | {'DD%':>7} | {'Trades':>7} | {'Best day%':>10} | {'Top5%':>7}")
-    for gs in (0.0, 0.25, 0.5, 1.0):
-        _, tr, cv, inf, daily, m = run_scenario(df, "A", gs, 0.0)
-        cs = concentration_stats(tr, daily)
-        if m.get("n"):
-            print(f"{gs:8.2f} | {m.get('exp', np.nan):+8.3f} | {m.get('ret', np.nan):+8.1f} | {m.get('dd', np.nan):7.1f} | {m['n']:7d} | {cs.get('best_day', 0):+10.2f} | {cs.get('top5_share', np.nan):7.1f}")
-        else:
-            print(f"{gs:8.2f} | aucun trade")
 
-    print("\nTEST B — slippage SL gap, TP gap fixé à 0.5")
-    print(f"{'SL slip':>8} | {'Exp R':>8} | {'Rend.%':>8} | {'DD%':>7} | {'Trades':>7}")
-    for gs in (0.0, 0.25, 0.5, 1.0):
-        _, tr, cv, inf, daily, m = run_scenario(df, "B", 0.5, gs)
-        if m.get("n"):
-            print(f"{gs:8.2f} | {m.get('exp', np.nan):+8.3f} | {m.get('ret', np.nan):+8.1f} | {m.get('dd', np.nan):7.1f} | {m['n']:7d}")
-        else:
-            print(f"{gs:8.2f} | aucun trade")
+    # ===== Run principal =====
+    tr, cv, inf, dl = run_momentum(df, p)
+    m = metrics(tr, cv, p.capital)
+    show("PERIODE COMPLETE", m, inf, dl, tr, bh)
 
-    print("\nTEST C — scénario pessimiste (TP 0.5, SL 0.5)")
-    _, tr, cv, inf, daily, m = run_scenario(df, "C", 0.5, 0.5)
-    show("PESSIMISTE — période complète", m, inf, daily, tr, bh)
-    cs = concentration_stats(tr, daily)
+    # ===== Run sans le meilleur jour =====
+    cs = concentration_stats(tr, dl)
     best_day = cs.get("best_day_date")
     if best_day is not None and pd.notna(best_day):
         excluded_day = pd.Timestamp(best_day).normalize()
-        _, tr2, cv2, inf2, daily2, m2 = run_scenario(
-            df, "C sans meilleur jour", 0.5, 0.5
-        )
-        # Re-run explicitly excluding the best day.
-        p2 = make_params(gap_slip_tp=0.5, gap_slip_sl=0.5, exclude_days=[excluded_day])
-        tr2, cv2, inf2, daily2 = run_orb(df, p2)
+        p2 = make_params(exclude_days=[excluded_day])
+        tr2, cv2, inf2, dl2 = run_momentum(df, p2)
         m2 = metrics(tr2, cv2, p2.capital)
-        show(f"PESSIMISTE sans le meilleur jour ({excluded_day:%Y-%m-%d})", m2, inf2, daily2, tr2, bh, False)
+        show(f"SANS LE MEILLEUR JOUR ({excluded_day:%Y-%m-%d})", m2, inf2, dl2, tr2, bh, False)
 
-    print("\nTEST D — très pessimiste (TP 1.0, SL 1.0)")
-    _, trd, cvd, infd, dld, md = run_scenario(df, "D", 1.0, 1.0)
-    show("TRÈS PESSIMISTE — période complète", md, infd, dld, trd, bh, False)
+    # ===== Sensibilité spread =====
+    print("\n=== SENSIBILITE SPREAD (net R | rend.% | DD% | n) ===")
+    for sp in (0.5, 1.0, 2.0, 4.0):
+        tr_s, cv_s, _, _ = run_momentum(df, make_params(spread=sp))
+        m_s = metrics(tr_s, cv_s, p.capital)
+        if m_s.get("n"):
+            print(f"spread {sp:.1f} : {m_s.get('exp', np.nan):+.3f}R | "
+                  f"{m_s.get('ret', np.nan):+.1f}% | DD {m_s.get('dd', np.nan):.1f}% | n={m_s['n']}")
+        else:
+            print(f"spread {sp:.1f} : aucun trade")
 
-    # Chronological out-of-sample validation: parameters are unchanged, later segment untouched.
+    # ===== Robustesse paramètres =====
+    print("\n=== ROBUSTESSE : RR (net R | rend.% | n) ===")
+    for rr in (1.5, 2.0, 2.5, 3.0, 4.0):
+        tr_r, cv_r, _, _ = run_momentum(df, make_params(rr=rr))
+        m_r = metrics(tr_r, cv_r, p.capital)
+        if m_r.get("n"):
+            print(f"RR {rr} : {m_r.get('exp', np.nan):+.3f}R | "
+                  f"{m_r.get('ret', np.nan):+.1f}% | n={m_r['n']}")
+
+    print("\n=== ROBUSTESSE : lookback range (net R | rend.% | n) ===")
+    for lb in (6, 12, 18, 24):
+        tr_l, cv_l, _, _ = run_momentum(df, make_params(lookback_bars=lb))
+        m_l = metrics(tr_l, cv_l, p.capital)
+        if m_l.get("n"):
+            print(f"LB {lb} : {m_l.get('exp', np.nan):+.3f}R | "
+                  f"{m_l.get('ret', np.nan):+.1f}% | n={m_l['n']}")
+
+    print("\n=== ROBUSTESSE : EMA (net R | rend.% | n) ===")
+    for ef, es in ((10, 30), (20, 50), (30, 100)):
+        tr_e, cv_e, _, _ = run_momentum(df, make_params(ema_fast=ef, ema_slow=es))
+        m_e = metrics(tr_e, cv_e, p.capital)
+        if m_e.get("n"):
+            print(f"EMA {ef}/{es} : {m_e.get('exp', np.nan):+.3f}R | "
+                  f"{m_e.get('ret', np.nan):+.1f}% | n={m_e['n']}")
+
+    # ===== OOS chronologique =====
     split = int(len(df) * (1.0 - oos))
     train_df = df.iloc[:split].reset_index(drop=True)
     test_df = df.iloc[split:].reset_index(drop=True)
-    print(f"\nTEST E — validation chronologique OOS ({100*oos:.0f}% final, {len(test_df)} bougies)")
+    print(f"\n=== VALIDATION OOS CHRONOLOGIQUE ({100*oos:.0f}% final) ===")
     for label, part in (("TRAIN", train_df), ("OOS", test_df)):
-        _, trv, cvv, infv, dlv, mv = run_scenario(part, label, 0.5, 0.5)
-        if mv.get("n"):
-            print(f"{label:5s}: trades={mv['n']:5d} | exp={mv.get('exp', np.nan):+.3f} R | PF={mv.get('pf', np.nan):.2f} | rendement={mv.get('ret', np.nan):+.1f}% | DD={mv.get('dd', np.nan):.1f}%")
+        tr_v, cv_v, inf_v, dl_v = run_momentum(part, p)
+        m_v = metrics(tr_v, cv_v, p.capital)
+        if m_v.get("n"):
+            print(f"{label:5s}: trades={m_v['n']:4d} | exp={m_v.get('exp', np.nan):+.3f}R | "
+                  f"PF={m_v.get('pf', np.nan):.2f} | ret={m_v.get('ret', np.nan):+.1f}% | "
+                  f"DD={m_v.get('dd', np.nan):.1f}%")
         else:
             print(f"{label:5s}: aucun trade exploitable")
-    print("\nNOTE: l'OOS chronologique est une première vérification, pas une preuve statistique ni une garantie de performance réelle.")
+
+    print("\nLecture : viser espérance > +0,15 R sur les deux segments "
+          "ET stabilité sur les paramètres. Un edge momentum H1 doit apparaître sur train ET OOS.")
 
 
+# ------------------------------------------------------------------------------
+# Service & main
+# ------------------------------------------------------------------------------
 async def health_server():
     port = int(os.getenv("PORT", "10000"))
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS ORB V8 backtest service OK - no live orders"
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+            body = b"ARKAS MOMENTUM V9 backtest service OK - no live orders"
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
+                         + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
         except Exception:
             pass
@@ -508,7 +520,6 @@ async def main():
         log(f"Erreur backtest: {type(exc).__name__}: {exc}")
     finally:
         keepalive_task.cancel()
-        # Keep health endpoint alive for hosted services; no trading loop.
         print("\nTERMINÉ. Aucun ordre n'a été passé.", flush=True)
         await server_task
 
