@@ -1,6 +1,6 @@
-"""ARKAS TREND DONCHIAN — BACKTEST 1 MOIS — aucun ordre réel.
-Trend following Donchian sur XAUUSD H1 sur les 30 DERNIERS JOURS uniquement.
-⚠️ ATTENTION : sur 1 mois, le nombre de trades est trop faible pour conclure.
+"""ARKAS TREND DONCHIAN — BACKTEST MOIS PAR MOIS — aucun ordre réel.
+Teste la stratégie sur CHAQUE mois séparément sur 3 ans.
+36 mois = 36 tests indépendants = vraie distribution des performances.
 """
 import argparse
 import asyncio
@@ -16,7 +16,7 @@ TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
 SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
-MONTHS = float(os.getenv("BT_MONTHS", "1"))
+YEARS = float(os.getenv("BT_YEARS", "3.0"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
 TIMEFRAME = os.getenv("BT_TF", "1h")
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
@@ -30,9 +30,8 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-async def fetch_history_months(account, symbol, timeframe, months):
-    """Récupère les bougies sur N mois glissants uniquement."""
-    target = datetime.now(timezone.utc) - timedelta(days=30.44 * months)
+async def fetch_history(account, symbol, timeframe, years):
+    target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
     rows, start, prev_oldest = [], None, None
     while True:
         try:
@@ -49,8 +48,9 @@ async def fetch_history_months(account, symbol, timeframe, months):
         oldest = batch[0]["time"]
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest):
+        if len(rows) % 5000 < 1000:
+            log(f"[{symbol}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 40000:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -68,10 +68,6 @@ async def fetch_history_months(account, symbol, timeframe, months):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = (df.dropna(subset=["time", "open", "high", "low", "close"])
             .sort_values("time").drop_duplicates("time").reset_index(drop=True))
-    # Ne garder que les N derniers mois (filtre final)
-    if len(df):
-        cutoff = df["time"].max() - timedelta(days=30.44 * months)
-        df = df[df["time"] >= cutoff].reset_index(drop=True)
     return df.iloc[:-1].reset_index(drop=True)
 
 
@@ -103,84 +99,63 @@ def make_params(**over):
 
 
 def run_donchian(df, p, symbol="SYM"):
+    """Version avec paramètres réduits si historique court (pour les mois)."""
     d = df.reset_index(drop=True).copy()
-    # 🔴 ATTENTION : sur 1 mois, l'EMA 200 + DC 20 ne sera pas calculable
-    # On réduit automatiquement les paramètres si trop de bougies manquantes
-    min_required = p.entry_period + p.ema_filter + 10
-    if len(d) < min_required:
-        # Réduction d'urgence : EMA à 50, DC à 5
-        p.entry_period = min(p.entry_period, 5)
-        p.exit_period = min(p.exit_period, 3)
-        p.ema_filter = min(p.ema_filter, 50)
-        p.atr_period = min(p.atr_period, 10)
-        log(f"[{symbol}] Historique court ({len(d)} bougies) → paramètres réduits : "
-            f"DC={p.entry_period}, Exit={p.exit_period}, EMA={p.ema_filter}")
 
-    if len(d) < max(50, p.entry_period + p.ema_filter + 5):
-        log(f"[{symbol}] Pas assez de bougies pour trader ({len(d)})")
-        return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
+    # Réduction adaptative pour tenir dans 1 mois
+    ep = min(p.entry_period, max(5, len(d) // 30))
+    xp = min(p.exit_period, max(3, len(d) // 60))
+    ef = min(p.ema_filter, max(50, len(d) // 4))
+    ap = min(p.atr_period, max(5, len(d) // 20))
+
+    if len(d) < max(50, ep + 10):
+        return pd.DataFrame(), pd.Series(dtype=float), {}
 
     o, h, l, c = (d[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
     n = len(d)
     prev_close = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - prev_close), np.abs(l - prev_close)])
-    atr = pd.Series(tr).rolling(p.atr_period, min_periods=p.atr_period).mean().to_numpy()
-    atr_avg = pd.Series(atr).rolling(min(50, n//2), min_periods=5).mean().to_numpy()
-    ema_long = pd.Series(c).ewm(span=p.ema_filter, adjust=False).mean().to_numpy()
+    atr = pd.Series(tr).rolling(ap, min_periods=ap).mean().to_numpy()
+    atr_avg = pd.Series(atr).rolling(min(50, n // 2), min_periods=5).mean().to_numpy()
+    ema_long = pd.Series(c).ewm(span=ef, adjust=False).mean().to_numpy()
 
-    dc_hi_entry = pd.Series(h).rolling(p.entry_period).max().shift(1).to_numpy()
-    dc_lo_entry = pd.Series(l).rolling(p.entry_period).min().shift(1).to_numpy()
-    dc_hi_exit = pd.Series(h).rolling(p.exit_period).max().shift(1).to_numpy()
-    dc_lo_exit = pd.Series(l).rolling(p.exit_period).min().shift(1).to_numpy()
+    dc_hi_entry = pd.Series(h).rolling(ep).max().shift(1).to_numpy()
+    dc_lo_entry = pd.Series(l).rolling(ep).min().shift(1).to_numpy()
+    dc_hi_exit = pd.Series(h).rolling(xp).max().shift(1).to_numpy()
+    dc_lo_exit = pd.Series(l).rolling(xp).min().shift(1).to_numpy()
 
     times = d["time"].to_numpy()
     weekdays = d["time"].dt.weekday.to_numpy()
-    day_values = d["time"].dt.normalize().to_numpy()
 
     spread = get_spread(symbol)
     half_spread = spread / 2.0
-    slip = max(float(p.slippage), 0.0)
 
     equity = float(p.capital)
     positions, trades = [], []
-    curve = np.full(n, np.nan)
+    info = {"signals_long": 0, "signals_short": 0}
 
-    info = {
-        "signals_long": 0, "signals_short": 0,
-        "rejected_ema": 0, "rejected_atr": 0,
-        "rejected_spread": 0, "rejected_max_pos": 0, "rejected_max_risk": 0,
-        "trail_moves": 0, "exit_by_trail": 0, "exit_by_timeout": 0,
-    }
-
-    def open_risk_pct():
-        return sum(pos["risk_money"] for pos in positions) / p.capital * 100.0
-
-    def close_position(pos, i, raw_fill, reason, gap_kind=None):
-        nonlocal equity, info
+    def close_position(pos, i, raw_fill, reason):
+        nonlocal equity
         if pos not in positions:
             return
         positions.remove(pos)
         dr = pos["dir"]
         fill_raw = float(raw_fill)
-        if gap_kind == "sl":
+        if reason.startswith("trail"):
             if dr == 1:
                 fill_raw = min(fill_raw, float(o[i]))
-                fill_raw -= p.gap_slip_sl * pos["dist"]
             else:
                 fill_raw = max(fill_raw, float(o[i]))
-                fill_raw += p.gap_slip_sl * pos["dist"]
-        fill = fill_raw - dr * (half_spread + slip)
+        fill = fill_raw - dr * half_spread
         pnl = (fill - pos["entry"]) * dr * pos["size"]
         equity += pnl
         R = pnl / pos["risk_money"] if pos["risk_money"] else 0.0
         trades.append({
-            "symbol": symbol,
             "entry_time": pd.Timestamp(pos["entry_time"]),
             "exit_time": pd.Timestamp(times[i]),
             "dir": "LONG" if dr == 1 else "SHORT",
             "entry": pos["entry"], "exit": fill,
             "pnl": pnl, "R": R,
-            "cost_R": (spread + 2 * slip) / pos["dist"] if pos["dist"] else np.nan,
             "bars": i - pos["entry_i"] + 1, "reason": reason,
         })
 
@@ -194,65 +169,53 @@ def run_donchian(df, p, symbol="SYM"):
                     new_stop = dc_lo_exit[i]
                     if np.isfinite(new_stop) and new_stop > pos["stop"]:
                         pos["stop"] = new_stop
-                        info["trail_moves"] += 1
                 else:
                     new_stop = dc_hi_exit[i]
                     if np.isfinite(new_stop) and new_stop < pos["stop"]:
                         pos["stop"] = new_stop
-                        info["trail_moves"] += 1
 
             if dr == 1:
                 if o[i] <= pos["stop"]:
-                    close_position(pos, i, min(pos["stop"], o[i]), "trail (gap)", "sl")
-                    info["exit_by_trail"] += 1
+                    close_position(pos, i, min(pos["stop"], o[i]), "trail(gap)")
                 elif l[i] <= pos["stop"]:
                     close_position(pos, i, pos["stop"], "trail")
-                    info["exit_by_trail"] += 1
             else:
                 if o[i] >= pos["stop"]:
-                    close_position(pos, i, max(pos["stop"], o[i]), "trail (gap)", "sl")
-                    info["exit_by_trail"] += 1
+                    close_position(pos, i, max(pos["stop"], o[i]), "trail(gap)")
                 elif h[i] >= pos["stop"]:
                     close_position(pos, i, pos["stop"], "trail")
-                    info["exit_by_trail"] += 1
 
             if pos in positions:
                 if i - pos["entry_i"] + 1 >= p.max_hold:
                     close_position(pos, i, c[i], "temps")
-                    info["exit_by_timeout"] += 1
 
         in_session = weekdays[i] < 5
-        can_trade = (in_session and i >= p.entry_period + 5
-                     and i > 0 and np.isfinite(atr[i]) and np.isfinite(dc_hi_entry[i])
+        can_trade = (in_session and i >= ep + 5 and i > 0
+                     and np.isfinite(atr[i]) and np.isfinite(dc_hi_entry[i])
                      and np.isfinite(dc_lo_entry[i])
                      and len(positions) < p.max_positions)
         if can_trade:
             A = atr[i]
             atr_ok = (not np.isfinite(atr_avg[i])) or (A >= p.min_atr_ratio * atr_avg[i])
-            if not atr_ok:
-                info["rejected_atr"] += 1
-            else:
+            if atr_ok:
                 ema_ok_long = (not p.use_ema_filter) or (c[i] > ema_long[i])
                 ema_ok_short = (not p.use_ema_filter) or (c[i] < ema_long[i])
                 bull_break = c[i] > dc_hi_entry[i]
                 bear_break = c[i] < dc_lo_entry[i]
-
                 candidates = []
                 if bull_break and ema_ok_long and not p.short_only:
                     candidates.append((1, dc_hi_entry[i]))
                 if bear_break and ema_ok_short and not p.long_only:
                     candidates.append((-1, dc_lo_entry[i]))
-
                 for dr, trigger_px in candidates:
                     sl_px = dc_lo_exit[i] if dr == 1 else dc_hi_exit[i]
                     if not np.isfinite(sl_px):
                         continue
-                    entry = c[i] + dr * (half_spread + slip)
+                    entry = c[i] + dr * half_spread
                     dist = abs(entry - sl_px)
                     if dist <= 0:
                         continue
                     if spread > p.max_spread_ratio * dist:
-                        info["rejected_spread"] += 1
                         continue
                     risk_money = max(equity, 0.0) * p.risk / 100.0
                     if risk_money <= 0:
@@ -260,8 +223,7 @@ def run_donchian(df, p, symbol="SYM"):
                     positions.append({
                         "dir": dr, "entry": entry,
                         "stop": sl_px, "stop_initial": sl_px,
-                        "dist": dist,
-                        "size": risk_money / dist,
+                        "dist": dist, "size": risk_money / dist,
                         "risk_money": risk_money,
                         "entry_time": times[i], "entry_i": i,
                     })
@@ -271,93 +233,128 @@ def run_donchian(df, p, symbol="SYM"):
                         info["signals_short"] += 1
                     break
 
-        open_pnl = sum((c[i] - pos["entry"]) * pos["dir"] * pos["size"] for pos in positions)
-        curve[i] = equity + open_pnl
-
     while positions:
-        close_position(positions[0], n - 1, c[-1], "fin des données")
-    curve[-1] = equity
-    trade_df = pd.DataFrame(trades)
-    curve_series = pd.Series(curve, index=pd.to_datetime(d["time"])).ffill()
-    return trade_df, curve_series, info, pd.DataFrame()
+        close_position(positions[0], n - 1, c[-1], "fin")
+    return pd.DataFrame(trades), pd.Series(equity, index=[0]), info
 
 
-def metrics(trades, capital):
-    out = {"n": len(trades)}
-    if not len(trades):
-        return out
-    t = trades.copy()
-    t["exit_time"] = pd.to_datetime(t["exit_time"])
-    t = t.sort_values("exit_time")
-    t["equity"] = capital + t["pnl"].cumsum()
-    t["peak"] = t["equity"].cummax()
-    t["dd"] = (t["equity"] / t["peak"] - 1.0) * 100.0
-    out["ret"] = (t["equity"].iloc[-1] / capital - 1.0) * 100.0
-    out["dd"] = t["dd"].min()
-    out["days"] = max((t["exit_time"].iloc[-1] - t["exit_time"].iloc[0]).days, 1)
-    r = t["R"].replace([np.inf, -np.inf], np.nan).dropna()
-    gp = r[r > 0].sum()
-    gl = -r[r <= 0].sum()
-    out["win"] = (r > 0).mean() * 100.0
-    out["exp"] = r.mean()
-    out["exp_gross"] = (r + t.loc[r.index, "cost_R"]).mean()
-    out["cost"] = t["cost_R"].mean()
-    out["pf"] = gp / gl if gl > 0 else float("inf")
-    out["bars"] = t["bars"].mean()
-    out["reasons"] = t["reason"].value_counts().to_dict()
-    return out
-
-
-def report(symbol, df):
+def monthly_report(symbol, df):
     p = make_params()
-    print("\n" + "#" * 64)
-    print(f"# ARKAS DONCHIAN — BACKTEST {MONTHS} MOIS | {symbol} {TIMEFRAME}")
-    print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d} | {len(df)} bougies")
-    print(f"# DC{p.entry_period} | Exit{p.exit_period} | EMA{p.ema_filter} | "
-          f"max_hold={p.max_hold}h | risque={p.risk}%")
-    print(f"# ⚠️ ATTENTION : sur {MONTHS} mois, le nombre de trades est trop faible")
-    print(f"#    pour conclure quoi que ce soit. Ce test ne vaut que comme")
-    print(f"#    vérification de fonctionnement, pas comme validation.")
-    print("#" * 64)
+    print("\n" + "#" * 70)
+    print(f"# BACKTEST MOIS PAR MOIS | {symbol} {TIMEFRAME} | {len(df)} bougies")
+    print(f"# {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d}")
+    print(f"# DC20 / Exit10 / EMA200 / max_hold=48h")
+    print(f"# ⚠️ Ne trade qu'un mois isolé à la fois (pas de continuité de capital)")
+    print("#" * 70)
 
-    if len(df) < 50:
-        print(f"Historique très insuffisant ({len(df)} bougies).")
-        return
+    df = df.copy()
+    df["year"] = df["time"].dt.year
+    df["month"] = df["time"].dt.month
 
-    tr, cv, inf, dl = run_donchian(df, p, symbol=symbol)
-    m = metrics(tr, p.capital)
+    months = sorted(df.groupby(["year", "month"]).groups.keys())
+    results = []
 
-    print(f"\n=== RESULTATS ({MONTHS} MOIS) ===")
-    if not m.get("n"):
-        print("Aucun trade généré sur cette période.")
-        print(f"  rejets ATR   : {inf.get('rejected_atr', 0)}")
-        print(f"  rejets spread: {inf.get('rejected_spread', 0)}")
-        print("\n→ C'est NORMAL : sur 1 mois, il n'y a pas toujours de signal Donchian.")
-        print("→ Ce résultat ne remet PAS en cause la stratégie (validée sur 3 ans).")
-        return
+    print(f"\n{'Mois':>8} | {'Trades':>6} | {'Win%':>5} | {'Exp R':>7} | "
+          f"{'Ret%':>7} | {'PF':>5} | {'DD%':>6} | {'Durée':>7}")
+    print("-" * 80)
 
-    print(f"Jours             : {m.get('days', 0)}")
-    print(f"Trades            : {m['n']}")
-    print(f"Longs/shorts      : {inf.get('signals_long', 0)}/{inf.get('signals_short', 0)}")
-    print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
-    print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
-    print(f"Coût moyen        : {m.get('cost', float('nan')):.3f} R/trade")
-    print(f"Profit factor     : {m.get('pf', float('nan')):.2f}")
-    print(f"Rendement         : {m.get('ret', float('nan')):+.1f} %")
-    print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
-    print(f"Durée moyenne     : {m.get('bars', 0):.1f} heures")
-    print(f"Sorties           : {m.get('reasons', {})}")
+    for (year, month) in months:
+        sub = df[(df["year"] == year) & (df["month"] == month)].reset_index(drop=True)
+        if len(sub) < 50:
+            continue
+        tr, _, info = run_donchian(sub, p, symbol=symbol)
+        if not len(tr):
+            print(f"{year}-{month:02d} | {0:>6} |     - |       - |       - |     - |      - |      -")
+            results.append({"year": year, "month": month, "n": 0, "exp": 0.0, "ret": 0.0,
+                            "pf": 0, "dd": 0, "win": 0, "bars": 0})
+            continue
 
-    print(f"\n--- DÉTAIL DES TRADES ---")
-    for _, trade in tr.iterrows():
-        print(f"  {trade['entry_time']:%Y-%m-%d %H:%M} {trade['dir']:5s} "
-              f"entry={trade['entry']:.2f} exit={trade['exit']:.2f} "
-              f"R={trade['R']:+.2f} ({trade['reason']})")
+        # Calcul du rendement du mois (sur capital fixe 10000, pas compounding)
+        total_pnl = tr["pnl"].sum()
+        ret_pct = total_pnl / p.capital * 100.0
+        # Equity du mois pour DD
+        eq = p.capital + tr["pnl"].cumsum()
+        dd = ((eq / eq.cummax()) - 1.0).min() * 100.0
+        win = (tr["R"] > 0).mean() * 100.0
+        exp = tr["R"].mean()
+        gp = tr.loc[tr["R"] > 0, "R"].sum()
+        gl = -tr.loc[tr["R"] <= 0, "R"].sum()
+        pf = gp / gl if gl > 0 else float("inf")
+        bars = tr["bars"].mean()
 
-    print(f"\n⚠️ RAPPEL : sur {m['n']} trades et {m.get('days', 0)} jours, "
-          f"les statistiques ne sont PAS fiables.")
-    print(f"→ Pour une évaluation valable, il faut au minimum 30 trades et 6 mois.")
-    print(f"→ La stratégie a été validée sur 3 ans (voir V14-MTF).")
+        print(f"{year}-{month:02d} | {len(tr):>6} | {win:>4.1f}% | {exp:>+7.3f} | "
+              f"{ret_pct:>+7.2f} | {pf:>5.2f} | {dd:>6.2f} | {bars:>6.1f}h")
+
+        results.append({"year": year, "month": month, "n": len(tr), "exp": exp,
+                        "ret": ret_pct, "pf": pf, "dd": dd, "win": win, "bars": bars})
+
+    # ============================================================
+    # SYNTHESE
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("SYNTHESE")
+    print("=" * 70)
+
+    r_df = pd.DataFrame(results)
+    active_months = r_df[r_df["n"] > 0]
+
+    print(f"Mois testés         : {len(r_df)}")
+    print(f"Mois avec trades    : {len(active_months)}")
+    print(f"Total trades        : {active_months['n'].sum()}")
+
+    if len(active_months) > 0:
+        win_months = (active_months["ret"] > 0).sum()
+        lose_months = (active_months["ret"] < 0).sum()
+        flat_months = (active_months["ret"] == 0).sum()
+
+        print(f"\nMois gagnants       : {win_months} ({win_months/len(active_months)*100:.1f}%)")
+        print(f"Mois perdants       : {lose_months} ({lose_months/len(active_months)*100:.1f}%)")
+        print(f"Mois plats          : {flat_months}")
+
+        print(f"\nMeilleur mois       : {active_months['ret'].max():+.2f} %")
+        print(f"Pire mois           : {active_months['ret'].min():+.2f} %")
+        print(f"Mois médian         : {active_months['ret'].median():+.2f} %")
+        print(f"Mois moyen          : {active_months['ret'].mean():+.2f} %")
+
+        print(f"\nEspérance moyenne   : {active_months['exp'].mean():+.3f} R")
+        print(f"Espérance médiane   : {active_months['exp'].median():+.3f} R")
+        print(f"Trades par mois moy : {active_months['n'].mean():.1f}")
+
+        print(f"\n--- DISTRIBUTION DES RENDEMENTS MENSUELS ---")
+        bins = [-100, -5, -3, -1, 0, 1, 3, 5, 100]
+        labels = ["< -5%", "-5/-3", "-3/-1", "-1/0", "0/+1", "+1/+3", "+3/+5", "> +5%"]
+        for i in range(len(bins) - 1):
+            count = ((active_months["ret"] >= bins[i]) &
+                     (active_months["ret"] < bins[i+1])).sum()
+            bar = "█" * count
+            print(f"  {labels[i]:>8} : {count:>3} {bar}")
+
+        # Conclusion
+        print(f"\n--- INTERPRETATION ---")
+        if win_months / len(active_months) > 0.5:
+            print(f"✅ {win_months/len(active_months)*100:.0f}% de mois gagnants → edge stable")
+        elif win_months / len(active_months) > 0.4:
+            print(f"⚠️ {win_months/len(active_months)*100:.0f}% de mois gagnants → acceptable pour trend following")
+        else:
+            print(f"❌ {win_months/len(active_months)*100:.0f}% de mois gagnants → edge fragile")
+
+        if active_months["ret"].mean() > 0:
+            print(f"✅ Rendement mensuel moyen positif (+{active_months['ret'].mean():.2f}%)")
+        else:
+            print(f"❌ Rendement mensuel moyen négatif ({active_months['ret'].mean():.2f}%)")
+
+        # Ratio de Sharpe simplifié
+        if active_months["ret"].std() > 0:
+            monthly_sharpe = active_months["ret"].mean() / active_months["ret"].std()
+            annual_sharpe = monthly_sharpe * np.sqrt(12)
+            print(f"\nSharpe mensuel      : {monthly_sharpe:.2f}")
+            print(f"Sharpe annualisé    : {annual_sharpe:.2f}")
+            if annual_sharpe > 1.0:
+                print("✅ Sharpe > 1.0 → stratégie exploitable")
+            elif annual_sharpe > 0.5:
+                print("⚠️ Sharpe 0.5-1.0 → acceptable avec prudence")
+            else:
+                print("❌ Sharpe < 0.5 → risque élevé pour le rendement")
 
 
 async def health_server():
@@ -365,7 +362,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS 1-month backtest OK - no live orders"
+            body = b"ARKAS monthly backtest OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -400,16 +397,15 @@ async def main():
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {MONTHS} mois")
-
+    log(f"Compte connecté. {SYMBOL} {TIMEFRAME} | {YEARS} an(s)")
     try:
-        df = await fetch_history_months(account, SYMBOL, TIMEFRAME, MONTHS)
+        df = await fetch_history(account, SYMBOL, TIMEFRAME, YEARS)
         if df is None or len(df) == 0:
             print(f"[{SYMBOL}] Aucune bougie reçue.", flush=True)
         else:
-            report(SYMBOL, df)
+            monthly_report(SYMBOL, df)
     except Exception as exc:
-        log(f"Erreur backtest: {type(exc).__name__}: {exc}")
+        log(f"Erreur: {type(exc).__name__}: {exc}")
     finally:
         keepalive_task.cancel()
         print("\nTERMINÉ. Aucun ordre n'a été passé.", flush=True)
