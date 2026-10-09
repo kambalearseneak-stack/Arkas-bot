@@ -1,6 +1,6 @@
-"""ARKAS TREND DONCHIAN V14 — backtest only. AUCUN ordre réel.
-Trend following par cassure de canal Donchian sur Daily.
-Famille Turtle Traders — edge documenté depuis 1980.
+"""ARKAS TREND DONCHIAN V14-MTF — backtest only. AUCUN ordre réel.
+Trend following Donchian multi-timeframe : M15, H1, H4, D1.
+Compare les résultats sur plusieurs timeframes pour choisir le meilleur.
 """
 import argparse
 import asyncio
@@ -15,21 +15,16 @@ from metaapi_cloud_sdk import MetaApi
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 REGION = os.getenv("METAAPI_REGION", "london")
-SYMBOLS = [s.strip() for s in os.getenv("BT_SYMBOLS", "XAUUSD").split(",") if s.strip()]
+SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
 YEARS = float(os.getenv("BT_YEARS", "3.0"))
 RISK_PCT = float(os.getenv("BT_RISK", "1.0"))
-TIMEFRAME = "1d"
 INITIAL_CAPITAL = float(os.getenv("BT_CAPITAL", "10000"))
-MAX_TRADES_PER_DAY = 5
+
+# Timeframes à tester dans l'ordre
+TIMEFRAMES = [tf.strip() for tf in os.getenv("BT_TFS", "15m,1h,4h,1d").split(",") if tf.strip()]
 
 SPREAD_OVERRIDES = {
     "XAUUSD": 0.30,
-    "US500":  0.50,
-    "USTEC":  1.0,
-    "NAS100": 1.0,
-    "EURUSD": 0.0001,
-    "GBPUSD": 0.00015,
-    "USDJPY": 0.01,
 }
 
 
@@ -40,13 +35,15 @@ def log(msg):
 async def fetch_history(account, symbol, timeframe, years):
     target = datetime.now(timezone.utc) - timedelta(days=365.25 * years)
     rows, start, prev_oldest = [], None, None
+    # Limite plus haute pour M15
+    max_rows = 130000 if timeframe in ("1m", "5m", "15m") else 30000
     while True:
         try:
             batch = await account.get_historical_candles(
                 symbol=symbol, timeframe=timeframe, start_time=start, limit=1000
             )
         except Exception as e:
-            log(f"[{symbol}] fetch error: {type(e).__name__}: {e}")
+            log(f"[{symbol} {timeframe}] fetch error: {type(e).__name__}: {e}")
             return None
         if not batch:
             break
@@ -55,9 +52,9 @@ async def fetch_history(account, symbol, timeframe, years):
         oldest = batch[0]["time"]
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        if len(rows) % 500 < 100:
-            log(f"[{symbol}] {len(rows)} bougies D1; plus ancienne : {oldest:%Y-%m-%d}")
-        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > 5000:
+        if len(rows) % 10000 < 1000:
+            log(f"[{symbol} {timeframe}] {len(rows)} bougies; plus ancienne : {oldest:%Y-%m-%d}")
+        if oldest <= target or (prev_oldest is not None and oldest >= prev_oldest) or len(rows) > max_rows:
             break
         prev_oldest = oldest
         start = oldest - timedelta(seconds=1)
@@ -79,18 +76,21 @@ async def fetch_history(account, symbol, timeframe, years):
 
 
 def get_spread(symbol):
-    return SPREAD_OVERRIDES.get(symbol.upper(), 0.0002)
+    return SPREAD_OVERRIDES.get(symbol.upper(), 0.30)
 
 
 def make_params(**over):
     p = argparse.Namespace(
         slippage=0.0, risk=RISK_PCT,
+        # Donchian
         entry_period=20,
         exit_period=10,
         ema_filter=200,
         use_ema_filter=True,
+        # Filtre ATR
         min_atr_ratio=0.5,
         atr_period=20,
+        # Gestion
         max_hold=200,
         max_positions=3,
         max_total_risk_pct=3.0,
@@ -106,7 +106,7 @@ def make_params(**over):
     return p
 
 
-def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
+def run_donchian(df, p, symbol="SYM", tf_label="?"):
     d = df.reset_index(drop=True).copy()
     if len(d) < max(250, p.entry_period + p.ema_filter + 10):
         return pd.DataFrame(), pd.Series(dtype=float), {}, pd.DataFrame()
@@ -119,7 +119,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
     atr_avg = pd.Series(atr).rolling(100, min_periods=20).mean().to_numpy()
     ema_long = pd.Series(c).ewm(span=p.ema_filter, adjust=False).mean().to_numpy()
 
-    # Canaux Donchian — décalés de 1 bougie
     dc_hi_entry = pd.Series(h).rolling(p.entry_period).max().shift(1).to_numpy()
     dc_lo_entry = pd.Series(l).rolling(p.entry_period).min().shift(1).to_numpy()
     dc_hi_exit = pd.Series(h).rolling(p.exit_period).max().shift(1).to_numpy()
@@ -138,19 +137,12 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
     curve = np.full(n, np.nan)
     daily_rows = []
 
-    excluded = set()
-    if p.exclude_days:
-        excluded = {np.datetime64(pd.Timestamp(x).normalize(), "D") for x in p.exclude_days}
-
-    if global_state is None:
-        global_state = {"positions_total": 0, "trades_today": {}}
-
     cur_day = None
     day_open_equity = equity
 
     info = {
         "signals_long": 0, "signals_short": 0,
-        "rejected_no_break": 0, "rejected_ema": 0, "rejected_atr": 0,
+        "rejected_ema": 0, "rejected_atr": 0,
         "rejected_spread": 0, "rejected_max_pos": 0, "rejected_max_risk": 0,
         "trail_moves": 0, "exit_by_trail": 0, "exit_by_timeout": 0,
         "fills_stop_gap": 0,
@@ -164,7 +156,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
         if pos not in positions:
             return
         positions.remove(pos)
-        global_state["positions_total"] = max(0, global_state["positions_total"] - 1)
         dr = pos["dir"]
         fill_raw = float(raw_fill)
         if gap_kind == "sl":
@@ -181,6 +172,7 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
         R = pnl / pos["risk_money"] if pos["risk_money"] else 0.0
         trades.append({
             "symbol": symbol,
+            "tf": tf_label,
             "entry_time": pd.Timestamp(pos["entry_time"]),
             "exit_time": pd.Timestamp(times[i]),
             "dir": "LONG" if dr == 1 else "SHORT",
@@ -189,7 +181,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
             "pnl": pnl, "R": R,
             "cost_R": (spread + 2 * slip) / pos["dist"] if pos["dist"] else np.nan,
             "bars": i - pos["entry_i"] + 1, "reason": reason,
-            "is_gap": gap_kind is not None,
         })
 
     for i in range(n):
@@ -240,7 +231,7 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                     info["exit_by_timeout"] += 1
 
         in_session = weekdays[i] < 5
-        can_trade = (in_session and i >= max(start_idx, p.entry_period + p.ema_filter + 5)
+        can_trade = (in_session and i >= p.entry_period + p.ema_filter + 5
                      and i > 0 and np.isfinite(atr[i]) and np.isfinite(atr_avg[i])
                      and np.isfinite(dc_hi_entry[i]) and np.isfinite(dc_lo_entry[i])
                      and len(positions) < p.max_positions)
@@ -281,9 +272,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                     if open_risk_pct() + risk_money / p.capital * 100.0 > p.max_total_risk_pct:
                         info["rejected_max_risk"] += 1
                         continue
-                    if global_state["positions_total"] >= p.max_positions:
-                        info["rejected_max_pos"] += 1
-                        continue
                     positions.append({
                         "dir": dr, "entry": entry,
                         "stop": sl_px, "stop_initial": sl_px,
@@ -292,7 +280,6 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
                         "risk_money": risk_money,
                         "entry_time": times[i], "entry_i": i,
                     })
-                    global_state["positions_total"] += 1
                     if dr == 1:
                         info["signals_long"] += 1
                     else:
@@ -315,19 +302,7 @@ def run_donchian(df, p, symbol="SYM", global_state=None, start_idx=0):
     return trade_df, curve_series, info, pd.DataFrame(daily_rows)
 
 
-def merge_results(results):
-    all_trades = []
-    all_info = {}
-    for sym, tr, cv, inf, dl in results:
-        if tr is not None and len(tr):
-            all_trades.append(tr)
-        for k, v in inf.items():
-            all_info[k] = all_info.get(k, 0) + v
-    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    return trades, all_info
-
-
-def metrics_multi(trades, capital):
+def metrics(trades, capital):
     out = {"n": len(trades)}
     if not len(trades):
         return out
@@ -358,144 +333,150 @@ def metrics_multi(trades, capital):
     return out
 
 
-def show_multi(title, m, info, trades):
-    print(f"\n=== {title} ===")
+def show_tf(label, m, info, trades):
+    print(f"\n=== {label} ===")
     if not m.get("n"):
         print("Aucun trade.")
-        print(f"  signaux rejetés (ATR) : {info.get('rejected_atr', 0)}")
         return
     print(f"Jours             : {m.get('days', 0)}")
     print(f"Trades            : {m['n']} ({m['n'] / max(m.get('days', 1), 1) * 365:.1f}/an)")
     print(f"Longs/shorts      : {info.get('signals_long', 0)}/{info.get('signals_short', 0)}")
-    print(f"  trailing moves  : {info.get('trail_moves', 0)}")
-    print(f"  sorties trail   : {info.get('exit_by_trail', 0)}")
-    print(f"  sorties temps   : {info.get('exit_by_timeout', 0)}")
-    print(f"  rejets ATR      : {info.get('rejected_atr', 0)}")
-    print(f"  rejets spread   : {info.get('rejected_spread', 0)}")
     print(f"Réussite          : {m.get('win', float('nan')):.1f} %")
     print(f"Espérance nette   : {m.get('exp', float('nan')):+.3f} R/trade")
+    print(f"Avant coûts       : {m.get('exp_gross', float('nan')):+.3f} R/trade")
+    print(f"Coût moyen        : {m.get('cost', float('nan')):.3f} R/trade")
     print(f"Profit factor     : {m.get('pf', float('nan')):.2f}")
     print(f"Rendement         : {m.get('ret', float('nan')):+.1f} %")
     print(f"Drawdown max      : {m.get('dd', float('nan')):.1f} %")
     print(f"Pires pertes suite: {m.get('streak', 0)}")
-    print(f"Durée moyenne     : {m.get('bars', 0):.1f} bougies D1")
+    print(f"Durée moyenne     : {m.get('bars', 0):.1f} bougies")
     print(f"Sorties           : {m.get('reasons', {})}")
-    if len(trades):
-        print("--- PAR SYMBOLE ---")
-        for sym, g in trades.groupby("symbol"):
-            r = g["R"]
-            print(f"  {sym:8s}: n={len(g):3d} | win={((r>0).mean()*100):5.1f}% | "
-                  f"exp={r.mean():+.3f}R | pnl={g['pnl'].sum():+.2f}")
 
 
-def run_single_symbol(dfs, symbols, params_override, label, p_base):
-    """Run un scénario avec des paramètres spécifiques et retourne (trades, metrics)."""
-    gs = {"positions_total": 0, "trades_today": {}}
-    results = []
-    for s in symbols:
-        df = dfs.get(s)
-        if df is None or not len(df):
-            continue
-        p = make_params(**params_override) if params_override else p_base
-        tr, cv, inf, dl = run_donchian(df, p, symbol=s, global_state=gs)
-        results.append((s, tr, cv, inf, dl))
-    t, _ = merge_results(results)
-    m = metrics_multi(t, p_base.capital)
-    return t, m
-
-
-def report(symbols, dfs, oos=0.30):
+def report(symbol, dfs_by_tf, oos=0.30):
     p = make_params()
     print("\n" + "#" * 64)
-    print(f"# ARKAS TREND DONCHIAN V14 | symboles : {symbols} | {TIMEFRAME}")
-    print(f"# Entry DC {p.entry_period} | Exit DC {p.exit_period} | "
-          f"EMA {p.ema_filter} | ATR min {p.min_atr_ratio}x | risque {p.risk}%")
-    print(f"# AUCUN ordre réel. Simulation OHLC D1.")
+    print(f"# ARKAS TREND DONCHIAN V14-MTF | {symbol}")
+    print(f"# Timeframes testés : {list(dfs_by_tf.keys())}")
+    print(f"# Config : DC{p.entry_period} | Exit{p.exit_period} | EMA{p.ema_filter} | ATR{p.min_atr_ratio}x")
+    print(f"# AUCUN ordre réel.")
     print("#" * 64)
 
-    # ---- Run principal ----
-    global_state = {"positions_total": 0, "trades_today": {}}
-    results = []
-    for s in symbols:
-        df = dfs.get(s)
-        if df is None or not len(df):
+    # ============================================================
+    # COMPARAISON ENTRE TIMEFRAMES
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("COMPARAISON TIMEFRAMES (config par défaut DC20/Exit10/EMA200)")
+    print("=" * 70)
+    print(f"{'TF':>5} | {'Trades':>7} | {'Win%':>6} | {'Exp R':>7} | "
+          f"{'Gross':>7} | {'Cost':>6} | {'PF':>5} | {'Ret%':>7} | {'DD%':>6}")
+    print("-" * 70)
+
+    all_results = {}
+    for tf, df in dfs_by_tf.items():
+        tr, cv, inf, dl = run_donchian(df, p, symbol=symbol, tf_label=tf)
+        m = metrics(tr, p.capital)
+        all_results[tf] = (tr, m, inf)
+        if m.get("n"):
+            print(f"{tf:>5} | {m['n']:>7} | {m.get('win', 0):>5.1f}% | "
+                  f"{m.get('exp', np.nan):>+7.3f} | {m.get('exp_gross', np.nan):>+7.3f} | "
+                  f"{m.get('cost', np.nan):>6.3f} | {m.get('pf', np.nan):>5.2f} | "
+                  f"{m.get('ret', np.nan):>+7.1f} | {m.get('dd', np.nan):>6.1f}")
+        else:
+            print(f"{tf:>5} | {'0':>7} |       - |       - |       - |      - |     - |       - |      -")
+
+    # ============================================================
+    # DÉTAIL PAR TIMEFRAME (un bloc complet chacun)
+    # ============================================================
+    for tf, (tr, m, inf) in all_results.items():
+        show_tf(f"DÉTAIL {tf.upper()}", m, inf, tr)
+
+    # ============================================================
+    # ROBUSTESSE : entry_period sur CHAQUE timeframe
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("ROBUSTESSE : entry_period par timeframe")
+    print("=" * 70)
+    for tf, df in dfs_by_tf.items():
+        print(f"\n--- TF {tf} ---")
+        for ep in (10, 20, 40, 60):
+            p2 = make_params(entry_period=ep)
+            tr, cv, inf, dl = run_donchian(df, p2, symbol=symbol, tf_label=tf)
+            m = metrics(tr, p.capital)
+            if m.get("n"):
+                print(f"  DC {ep:2d} : {m.get('exp', np.nan):+.3f}R | "
+                      f"{m.get('ret', np.nan):+.1f}% | n={m['n']}")
+
+    # ============================================================
+    # ROBUSTESSE : exit_period sur CHAQUE timeframe
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("ROBUSTESSE : exit_period par timeframe")
+    print("=" * 70)
+    for tf, df in dfs_by_tf.items():
+        print(f"\n--- TF {tf} ---")
+        for xp in (5, 10, 20):
+            p2 = make_params(exit_period=xp)
+            tr, cv, inf, dl = run_donchian(df, p2, symbol=symbol, tf_label=tf)
+            m = metrics(tr, p.capital)
+            if m.get("n"):
+                print(f"  Exit {xp:2d} : {m.get('exp', np.nan):+.3f}R | "
+                      f"{m.get('ret', np.nan):+.1f}% | n={m['n']}")
+
+    # ============================================================
+    # ROBUSTESSE : EMA filter
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("ROBUSTESSE : EMA filter par timeframe")
+    print("=" * 70)
+    for tf, df in dfs_by_tf.items():
+        print(f"\n--- TF {tf} ---")
+        for ef in (100, 200, 300):
+            p2 = make_params(ema_filter=ef)
+            tr, cv, inf, dl = run_donchian(df, p2, symbol=symbol, tf_label=tf)
+            m = metrics(tr, p.capital)
+            if m.get("n"):
+                print(f"  EMA {ef} : {m.get('exp', np.nan):+.3f}R | "
+                      f"{m.get('ret', np.nan):+.1f}% | n={m['n']}")
+
+    # ============================================================
+    # OOS chronologique par timeframe
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("OOS CHRONOLOGIQUE (70% train / 30% test) par timeframe")
+    print("=" * 70)
+    for tf, df in dfs_by_tf.items():
+        if len(df) < 500:
             continue
-        tr, cv, inf, dl = run_donchian(df, p, symbol=s, global_state=global_state)
-        results.append((s, tr, cv, inf, dl))
+        split = int(len(df) * 0.70)
+        train_df = df.iloc[:split].reset_index(drop=True)
+        test_df = df.iloc[split:].reset_index(drop=True)
 
-    trades, info = merge_results(results)
-    m = metrics_multi(trades, p.capital)
-    show_multi("PERIODE COMPLETE (DEFAUT)", m, info, trades)
+        tr_t, _, _, _ = run_donchian(train_df, p, symbol=symbol, tf_label=tf)
+        mt = metrics(tr_t, p.capital)
 
-    if m.get("n"):
-        t_d = trades.copy()
-        t_d["exit_time"] = pd.to_datetime(t_d["exit_time"])
-        t_d["day"] = t_d["exit_time"].dt.normalize()
-        day_pnl = t_d.groupby("day")["pnl"].sum().sort_values(ascending=False)
-        if len(day_pnl):
-            best_day = day_pnl.index[0]
-            t2 = t_d[t_d["day"] != best_day]
-            if len(t2):
-                m2 = metrics_multi(t2, p.capital)
-                show_multi(f"SANS LE MEILLEUR JOUR ({best_day:%Y-%m-%d})", m2, info, t2)
+        tr_te, _, _, _ = run_donchian(test_df, p, symbol=symbol, tf_label=tf)
+        mte = metrics(tr_te, p.capital)
 
-    # ---- Robustesse entry_period ----
-    print("\n=== ROBUSTESSE : entry_period (net R | rend.% | n) ===")
-    for ep in (10, 20, 40, 60):
-        t2, m2 = run_single_symbol(dfs, symbols, {"entry_period": ep}, f"DC{ep}", p)
-        if m2.get("n"):
-            print(f"DC {ep} : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
+        print(f"\n--- TF {tf} ---")
+        print(f"  TRAIN : n={mt.get('n', 0):3d} | exp={mt.get('exp', np.nan):+.3f}R | "
+              f"PF={mt.get('pf', np.nan):.2f} | ret={mt.get('ret', np.nan):+.1f}%")
+        print(f"  TEST  : n={mte.get('n', 0):3d} | exp={mte.get('exp', np.nan):+.3f}R | "
+              f"PF={mte.get('pf', np.nan):.2f} | ret={mte.get('ret', np.nan):+.1f}%")
 
-    # ---- Robustesse exit_period ----
-    print("\n=== ROBUSTESSE : exit_period (net R | rend.% | n) ===")
-    for xp in (5, 10, 20):
-        t2, m2 = run_single_symbol(dfs, symbols, {"exit_period": xp}, f"Exit{xp}", p)
-        if m2.get("n"):
-            print(f"Exit DC {xp} : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
-
-    # ---- Robustesse EMA ----
-    print("\n=== ROBUSTESSE : EMA filter (net R | rend.% | n) ===")
-    for ef in (100, 150, 200, 300):
-        t2, m2 = run_single_symbol(dfs, symbols, {"ema_filter": ef}, f"EMA{ef}", p)
-        if m2.get("n"):
-            print(f"EMA {ef} : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
-
-    # ---- Robustesse ATR ----
-    print("\n=== ROBUSTESSE : filtre ATR (net R | rend.% | n) ===")
-    for ar in (0.3, 0.5, 0.7, 1.0):
-        t2, m2 = run_single_symbol(dfs, symbols, {"min_atr_ratio": ar}, f"ATR{ar}", p)
-        if m2.get("n"):
-            print(f"ATR min {ar}x : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
-
-    # ---- Sans EMA ----
-    print("\n=== SANS filtre EMA (net R | rend.% | n) ===")
-    t2, m2 = run_single_symbol(dfs, symbols, {"use_ema_filter": False}, "NoEMA", p)
-    if m2.get("n"):
-        print(f"Sans EMA : {m2.get('exp', np.nan):+.3f}R | "
-              f"{m2.get('ret', np.nan):+.1f}% | n={m2['n']}")
-
-    # ---- Combinaison optimale (DC10 + Exit20 + EMA300) ----
-    print("\n=== COMBINAISONS OPTIMALES ===")
-    combos = [
-        ({"entry_period": 10}, "DC10"),
-        ({"entry_period": 10, "exit_period": 20}, "DC10+Exit20"),
-        ({"entry_period": 10, "exit_period": 20, "ema_filter": 300}, "DC10+Exit20+EMA300"),
-        ({"entry_period": 20, "exit_period": 20, "ema_filter": 300}, "DC20+Exit20+EMA300"),
-        ({"entry_period": 10, "exit_period": 20, "ema_filter": 300, "min_atr_ratio": 0.3}, "DC10+Exit20+EMA300+ATR0.3"),
-    ]
-    for kw, label in combos:
-        t2, m2 = run_single_symbol(dfs, symbols, kw, label, p)
-        if m2.get("n"):
-            print(f"{label:30s} : {m2.get('exp', np.nan):+.3f}R | "
-                  f"{m2.get('ret', np.nan):+.1f}% | "
-                  f"DD {m2.get('dd', np.nan):.1f}% | n={m2['n']}")
-
-    print("\nLecture : viser espérance > +0,10 R, PF > 1, stabilité sur DC/EMA/ATR.",
-          flush=True)
+    # ============================================================
+    # CONCLUSION
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("LECTURE")
+    print("=" * 70)
+    print("1. Sur quel timeframe l'espérance est-elle POSITIVE et robuste ?")
+    print("2. L'OOS train ET test sont-ils positifs sur ce timeframe ?")
+    print("3. Le coût (cost_R) est-il acceptable (< 0.15 R) ?")
+    print("4. Les robustesses (DC/Exit/EMA) sont-elles stables ?")
+    print("")
+    print("Si un timeframe coche TOUTES ces cases → on passe à la V14b (D1 + OOS).")
+    print("Sinon → D1 reste le meilleur choix (V14 déjà positive).")
 
 
 async def health_server():
@@ -503,7 +484,7 @@ async def health_server():
     async def handle(reader, writer):
         try:
             await reader.read(1024)
-            body = b"ARKAS TREND V14 backtest OK - no live orders"
+            body = b"ARKAS V14-MTF backtest OK - no live orders"
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                          + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
@@ -538,22 +519,22 @@ async def main():
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
-    log(f"Compte connecté. Symboles : {SYMBOLS} | {TIMEFRAME} | {YEARS} an(s)")
+    log(f"Compte connecté. {SYMBOL} | TFs: {TIMEFRAMES} | {YEARS} an(s)")
 
-    dfs = {}
-    for s in SYMBOLS:
+    dfs_by_tf = {}
+    for tf in TIMEFRAMES:
         try:
-            df = await fetch_history(account, s, TIMEFRAME, YEARS)
+            df = await fetch_history(account, SYMBOL, tf, YEARS)
             if df is not None and len(df) > 250:
-                dfs[s] = df
-                log(f"[{s}] {len(df)} bougies D1 chargées")
+                dfs_by_tf[tf] = df
+                log(f"[{SYMBOL} {tf}] {len(df)} bougies chargées")
             else:
-                log(f"[{s}] données insuffisantes ({len(df) if df is not None else 0} bougies)")
+                log(f"[{SYMBOL} {tf}] données insuffisantes ({len(df) if df is not None else 0})")
         except Exception as exc:
-            log(f"[{s}] erreur: {type(exc).__name__}: {exc}")
+            log(f"[{SYMBOL} {tf}] erreur: {type(exc).__name__}: {exc}")
 
-    if dfs:
-        report(list(dfs.keys()), dfs)
+    if dfs_by_tf:
+        report(SYMBOL, dfs_by_tf)
     else:
         print("Aucune donnée chargée.", flush=True)
 
