@@ -17,7 +17,6 @@ from metaapi_cloud_sdk import MetaApi
 # ============================================================
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
-REGION = os.getenv("METAAPI_REGION", "london")
 
 SYMBOL = os.getenv("BT_SYMBOL", "XAUUSD")
 TIMEFRAME = os.getenv("BT_TF", "1h")
@@ -396,15 +395,15 @@ async def main():
     server_task = asyncio.create_task(health_server())
     keepalive_task = asyncio.create_task(keepalive())
 
-    # Connexion MetaApi (compatible SDK 29.0+ : mot-clés explicites)
-    api = MetaApi(token=TOKEN, region=REGION)
+    # ==== Connexion MetaApi (SDK 29+ : sans region explicite) ====
+    api = MetaApi(TOKEN)
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
     if account.state != "DEPLOYED":
         await account.deploy()
     await account.wait_connected()
     log("✅ Compte MetaApi connecté")
 
-    # ==== Connexion RPC (créée une seule fois, SANS await sur get_rpc_connection) ====
+    # ==== Connexion RPC (une seule fois) ====
     rpc = account.get_rpc_connection()
     await rpc.connect()
     await rpc.wait_synchronized()
