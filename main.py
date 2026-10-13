@@ -1,8 +1,9 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
 from metaapi_cloud_sdk import MetaApi
 
@@ -10,6 +11,9 @@ from metaapi_cloud_sdk import MetaApi
 load_dotenv()
 
 # ================= CONFIGURATION =================
+TOKEN = os.getenv("METAAPI_TOKEN")
+ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
+
 SYMBOLS = [
     "Volatility 75 Index",
     "Volatility 100 Index",
@@ -24,36 +28,37 @@ STOCH_SLOW = 3
 LOT_SIZE = 0.1
 COOLDOWN_SECONDS = 3600
 
+# SL/TP/Trailing en POINTS
 SL_POINTS = 300
 TP_POINTS = 500
 TRAILING_POINTS = 100
 TRAILING_STEP = 10
 
+# Mode
+LIVE_MODE = os.getenv("LIVE_MODE", "true").lower() == "true"
+
 # Variables globales pour le cooldown
 last_trade_time = {}
 
-# ================= FONCTIONS TECHNIQUES =================
+# ================= LOG =================
+def log(msg, level="INFO"):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    prefix = {"INFO": "ℹ️", "SIGNAL": "📊", "ORDER": "💼", "WARN": "⚠️",
+              "ERROR": "🚨"}.get(level, "•")
+    print(f"[{ts}] {prefix} [{level}] {msg}", flush=True)
 
+# ================= INDICATEURS =================
 def calculate_stochastic(df, k_period=5, d_period=3, slow=3):
-    """
-    Calcule le Stochastic Oscillator en temps réel sur un DataFrame.
-    """
     df = df.copy()
     df['high_k'] = df['high'].rolling(window=k_period).max()
     df['low_k'] = df['low'].rolling(window=k_period).min()
-    
     denominator = (df['high_k'] - df['low_k']).replace(0, 0.00001)
-    
     df['%K'] = 100 * ((df['close'] - df['low_k']) / denominator)
     df['%K'] = df['%K'].rolling(window=slow).mean()
     df['%D'] = df['%K'].rolling(window=d_period).mean()
-    
     return df
 
 def get_signal(stoch_k, stoch_d):
-    """
-    Détermine le signal selon les niveaux de l'indicateur.
-    """
     if stoch_k < 10 and stoch_d < 10:
         return "FULL_BUY"
     elif stoch_k < 20 and stoch_d < 20:
@@ -65,21 +70,27 @@ def get_signal(stoch_k, stoch_d):
     return None
 
 def is_cooldown_active(symbol):
-    """
-    Vérifie si le cooldown est actif pour un symbole donné.
-    """
     now = time.time()
     last_time = last_trade_time.get(symbol, 0)
     if now - last_time < COOLDOWN_SECONDS:
         return True, int(COOLDOWN_SECONDS - (now - last_time))
     return False, 0
 
-# ================= GESTION DES ORDRES =================
+# ================= COMPTE =================
+async def get_account_info(rpc):
+    try:
+        info = await rpc.get_account_information()
+        return {
+            "balance": float(info.get("balance", 0)),
+            "equity": float(info.get("equity", 0)),
+            "marginFree": float(info.get("freeMargin", info.get("marginFree", 0))),
+        }
+    except Exception as e:
+        log(f"Erreur get_account_info: {type(e).__name__}: {e}", "ERROR")
+        return {"balance": 0, "equity": 0, "marginFree": 0}
 
-async def execute_order(connection, symbol, signal, current_price, tick_size):
-    """
-    Exécute un ordre avec SL, TP et Trailing Stop.
-    """
+# ================= ORDRES =================
+async def execute_order(rpc, symbol, signal, current_price, tick_size):
     order_type = "BUY" if "BUY" in signal else "SELL"
     
     if order_type == "BUY":
@@ -96,9 +107,13 @@ async def execute_order(connection, symbol, signal, current_price, tick_size):
         }
     }
     
+    if not LIVE_MODE:
+        log(f"[DRY_RUN] {order_type} {LOT_SIZE} lots {symbol} @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
+        return "dry-run"
+    
     try:
         if order_type == "BUY":
-            result = await connection.create_market_buy_order(
+            result = await rpc.create_market_buy_order(
                 symbol=symbol,
                 volume=LOT_SIZE,
                 stop_loss=sl_price,
@@ -106,7 +121,7 @@ async def execute_order(connection, symbol, signal, current_price, tick_size):
                 options=trailing_options
             )
         else:
-            result = await connection.create_market_sell_order(
+            result = await rpc.create_market_sell_order(
                 symbol=symbol,
                 volume=LOT_SIZE,
                 stop_loss=sl_price,
@@ -114,39 +129,36 @@ async def execute_order(connection, symbol, signal, current_price, tick_size):
                 options=trailing_options
             )
         
-        print(f"✅ [{symbol}] Ordre {order_type} exécuté | Prix: {current_price} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
+        log(f"✅ [{symbol}] {order_type} exécuté @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
         return result
-    
     except Exception as e:
-        print(f"❌ [{symbol}] Erreur lors de l'exécution de l'ordre : {e}")
+        log(f"❌ [{symbol}] Erreur ordre : {type(e).__name__}: {e}", "ERROR")
         return None
 
-# ================= BOUCLE PRINCIPALE =================
-
-async def process_symbol(connection, symbol, symbol_specs):
-    """
-    Traite un symbole : récupère les données, calcule le signal et exécute.
-    """
+# ================= TRAITEMENT =================
+async def process_symbol(rpc, symbol, symbol_specs):
     try:
-        # 1. Récupérer les données récentes (CORRIGÉ : get_candles)
-        candles = await connection.get_candles(
+        # ⚠️ CORRECTION ICI : utilisation de get_historical_candles (comme dans votre bot Donchian)
+        candles = await rpc.get_historical_candles(
             symbol=symbol,
             timeframe=TIMEFRAME,
-            start_time=datetime.now() - timedelta(hours=50),
             limit=100
         )
         
         if not candles or len(candles) < 20:
-            print(f"⚠️ [{symbol}] Pas assez de données historiques.")
+            log(f"⚠️ [{symbol}] Pas assez de données.", "WARN")
             return
         
-        # 2. Convertir en DataFrame
-        df = pd.DataFrame(candles)
+        df = pd.DataFrame([
+            {"time": r["time"], "open": r["open"], "high": r["high"],
+             "low": r["low"], "close": r["close"]}
+            for r in candles
+        ])
+        df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
+        df = df.sort_values("time").reset_index(drop=True)
         
-        # 3. Calculer le Stochastic en temps réel
         df = calculate_stochastic(df, STOCH_K, STOCH_D, STOCH_SLOW)
         
-        # 4. Prendre la dernière valeur (bougie en cours)
         latest = df.iloc[-1]
         stoch_k = latest['%K']
         stoch_d = latest['%D']
@@ -155,80 +167,78 @@ async def process_symbol(connection, symbol, symbol_specs):
         if pd.isna(stoch_k) or pd.isna(stoch_d):
             return
         
-        print(f"📊 [{symbol}] %K: {stoch_k:.2f} | %D: {stoch_d:.2f} | Prix: {current_price}")
+        log(f"📊 [{symbol}] %K: {stoch_k:.2f} | %D: {stoch_d:.2f} | Prix: {current_price:.2f}")
         
-        # 5. Détecter le signal
         signal = get_signal(stoch_k, stoch_d)
         
         if signal:
             cooldown, remaining = is_cooldown_active(symbol)
             if cooldown:
-                print(f"⏳ [{symbol}] Cooldown actif. Prochain trade dans {remaining}s.")
+                log(f"⏳ [{symbol}] Cooldown actif. Prochain trade dans {remaining}s.", "WARN")
                 return
             
             tick_size = symbol_specs.get(symbol, {}).get('tickSize', 0.01)
-            
-            result = await execute_order(connection, symbol, signal, current_price, tick_size)
+            result = await execute_order(rpc, symbol, signal, current_price, tick_size)
             
             if result:
                 last_trade_time[symbol] = time.time()
     
     except Exception as e:
-        print(f"⚠️ [{symbol}] Erreur dans le traitement : {e}")
+        log(f"⚠️ [{symbol}] Erreur traitement : {type(e).__name__}: {e}", "ERROR")
 
-async def run_bot():
-    token = os.getenv("METAAPI_TOKEN")
-    account_id = os.getenv("METAAPI_ACCOUNT_ID")
-    
-    if not token or not account_id:
-        print("❌ Erreur : Variables METAAPI_TOKEN ou METAAPI_ACCOUNT_ID manquantes.")
-        return
+# ================= MAIN =================
+async def main():
+    if not TOKEN or not ACCOUNT_ID:
+        raise RuntimeError("METAAPI_TOKEN et METAAPI_ACCOUNT_ID requis.")
 
-    api = MetaApi(token)
-    connection = None
-    
-    try:
-        account = await api.metatrader_account_api.get_account(account_id)
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
-        
-        print(f"✅ Connecté au compte {account_id}")
-        print(f"🚀 Bot démarré pour {len(SYMBOLS)} indices : {', '.join(SYMBOLS)}")
-        
-        # Récupérer les spécifications de tous les symboles
-        symbol_specs = {}
-        for symbol in SYMBOLS:
-            try:
-                specs = await connection.get_symbol_specification(symbol)
-                symbol_specs[symbol] = specs
-                print(f"📋 [{symbol}] TickSize: {specs.get('tickSize')}")
-            except Exception as e:
-                print(f"⚠️ Impossible de récupérer les specs de {symbol} : {e}")
-        
-        # Boucle principale
-        while True:
-            try:
-                tasks = [process_symbol(connection, symbol, symbol_specs) for symbol in SYMBOLS]
-                await asyncio.gather(*tasks)
-                
-                # Attendre 30 secondes avant la prochaine vérification
-                await asyncio.sleep(30)
-                
-            except Exception as e:
-                print(f"⚠️ Erreur dans la boucle principale : {e}")
-                await asyncio.sleep(60)
-    
-    except Exception as e:
-        print(f"❌ Erreur de connexion : {e}")
-    
-    finally:
-        if connection:
-            try:
-                await connection.close()
-                print("🔌 Connexion fermée.")
-            except:
-                pass
+    log("=" * 65)
+    log("ARKAS STOCHASTIC BOT")
+    log(f"Symboles  : {', '.join(SYMBOLS)}")
+    log(f"Timeframe : {TIMEFRAME}")
+    log(f"Mode      : {'🔴 LIVE' if LIVE_MODE else '🟢 DRY-RUN'}")
+    log("=" * 65)
+
+    api = MetaApi(TOKEN)
+    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+    if account.state != "DEPLOYED":
+        await account.deploy()
+    await account.wait_connected()
+    log("✅ Compte MetaApi connecté")
+
+    rpc = account.get_rpc_connection()
+    await rpc.connect()
+    await rpc.wait_synchronized()
+    log("✅ Connexion RPC prête et synchronisée")
+
+    info = await get_account_info(rpc)
+    log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f}")
+
+    # Récupérer les spécifications de tous les symboles
+    symbol_specs = {}
+    for symbol in SYMBOLS:
+        try:
+            specs = await rpc.get_symbol_specification(symbol)
+            symbol_specs[symbol] = specs
+            log(f"📋 [{symbol}] TickSize: {specs.get('tickSize')}")
+        except Exception as e:
+            log(f"⚠️ Impossible de récupérer les specs de {symbol} : {e}", "WARN")
+            symbol_specs[symbol] = {"tickSize": 0.01}
+
+    log(f"📡 Surveillance de {len(SYMBOLS)} indices démarrée")
+    log("Boucle : vérification toutes les 30 secondes")
+
+    while True:
+        try:
+            tasks = [process_symbol(rpc, symbol, symbol_specs) for symbol in SYMBOLS]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log(f"Erreur boucle: {type(e).__name__}: {e}", "ERROR")
+            await asyncio.sleep(60)
+
+    log("Bot arrêté.")
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(main())
