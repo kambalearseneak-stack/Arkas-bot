@@ -136,12 +136,13 @@ async def execute_order(rpc, symbol, signal, current_price, tick_size):
         return None
 
 # ================= TRAITEMENT =================
-async def process_symbol(rpc, symbol, symbol_specs):
+async def process_symbol(account, rpc, symbol, symbol_specs):
     try:
-        # ⚠️ CORRECTION ICI : utilisation de get_historical_candles (comme dans votre bot Donchian)
-        candles = await rpc.get_historical_candles(
+        # ✅ CORRECTION : Utilisation de account.get_historical_candles
+        candles = await account.get_historical_candles(
             symbol=symbol,
             timeframe=TIMEFRAME,
+            start_time=None,
             limit=100
         )
         
@@ -198,6 +199,7 @@ async def main():
     log(f"Mode      : {'🔴 LIVE' if LIVE_MODE else '🟢 DRY-RUN'}")
     log("=" * 65)
 
+    # ✅ CORRECTION : La connexion au compte est faite en dehors de la boucle
     api = MetaApi(TOKEN)
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
     if account.state != "DEPLOYED":
@@ -229,7 +231,8 @@ async def main():
 
     while True:
         try:
-            tasks = [process_symbol(rpc, symbol, symbol_specs) for symbol in SYMBOLS]
+            # ✅ CORRECTION : On passe account et rpc à process_symbol
+            tasks = [process_symbol(account, rpc, symbol, symbol_specs) for symbol in SYMBOLS]
             await asyncio.gather(*tasks)
             await asyncio.sleep(30)
         except asyncio.CancelledError:
