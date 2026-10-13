@@ -57,15 +57,20 @@ def calculate_stochastic(df, k_period=5, d_period=3, slow=3):
     df['%D'] = df['%K'].rolling(window=d_period).mean()
     return df
 
-def get_signal(stoch_k, stoch_d):
-    if stoch_k < 10 and stoch_d < 10:
-        return "FULL_BUY"
-    elif stoch_k < 20 and stoch_d < 20:
+def get_signal(stoch_k, stoch_d, prev_k, prev_d):
+    """
+    Détecte un signal par croisement du %K et %D dans les zones extrêmes.
+    - BUY  : %K croise au-dessus de %D dans la zone < 20 (survente)
+    - SELL : %K croise en dessous de %D dans la zone > 80 (surachat)
+    """
+    # Croisement haussier en zone de survente
+    if prev_k <= prev_d and stoch_k > stoch_d and stoch_k < 20:
         return "BUY"
-    elif stoch_k > 90 and stoch_d > 90:
-        return "FULL_SELL"
-    elif stoch_k > 80 and stoch_d > 80:
+    
+    # Croisement baissier en zone de surachat
+    if prev_k >= prev_d and stoch_k < stoch_d and stoch_k > 80:
         return "SELL"
+    
     return None
 
 def is_cooldown_active(symbol):
@@ -90,9 +95,9 @@ async def get_account_info(rpc):
 
 # ================= ORDRES =================
 async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs):
-    order_type = "BUY" if "BUY" in signal else "SELL"
+    order_type = "BUY" if signal == "BUY" else "SELL"
     
-    # ✅ CORRECTION : Arrondi basé sur les décimales du symbole
+    # Arrondi basé sur les décimales du symbole
     digits = symbol_specs.get(symbol, {}).get('digits', 2)
     
     if order_type == "BUY":
@@ -161,19 +166,26 @@ async def process_symbol(account, rpc, symbol, symbol_specs):
         
         df = calculate_stochastic(df, STOCH_K, STOCH_D, STOCH_SLOW)
         
+        # ✅ CORRECTION : On récupère la bougie actuelle ET la précédente
         latest = df.iloc[-1]
+        previous = df.iloc[-2]
         stoch_k = latest['%K']
         stoch_d = latest['%D']
+        prev_k = previous['%K']
+        prev_d = previous['%D']
         current_price = latest['close']
         
-        if pd.isna(stoch_k) or pd.isna(stoch_d):
+        if pd.isna(stoch_k) or pd.isna(stoch_d) or pd.isna(prev_k) or pd.isna(prev_d):
             return
         
         log(f"📊 [{symbol}] %K: {stoch_k:.2f} | %D: {stoch_d:.2f} | Prix: {current_price:.2f}")
         
-        signal = get_signal(stoch_k, stoch_d)
+        # ✅ CORRECTION : On passe les valeurs précédentes à get_signal
+        signal = get_signal(stoch_k, stoch_d, prev_k, prev_d)
         
         if signal:
+            log(f"🎯 [{symbol}] SIGNAL {signal} détecté par croisement !", "SIGNAL")
+            
             cooldown, remaining = is_cooldown_active(symbol)
             if cooldown:
                 log(f"⏳ [{symbol}] Cooldown actif. Prochain trade dans {remaining}s.", "WARN")
@@ -194,7 +206,7 @@ async def main():
         raise RuntimeError("METAAPI_TOKEN et METAAPI_ACCOUNT_ID requis.")
 
     log("=" * 65)
-    log("ARKAS STOCHASTIC BOT")
+    log("ARKAS STOCHASTIC BOT — Croisement %K/%D")
     log(f"Symboles  : {', '.join(SYMBOLS)}")
     log(f"Timeframe : {TIMEFRAME}")
     log(f"Mode      : {'🔴 LIVE' if LIVE_MODE else '🟢 DRY-RUN'}")
@@ -227,6 +239,7 @@ async def main():
 
     log(f"📡 Surveillance de {len(SYMBOLS)} indices démarrée")
     log("Boucle : vérification toutes les 30 secondes")
+    log("Stratégie : croisement %K/%D en zones extrêmes")
 
     while True:
         try:
