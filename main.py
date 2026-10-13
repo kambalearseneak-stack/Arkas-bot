@@ -15,7 +15,6 @@ TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 
 SYMBOLS = [
-    "Volatility 75 Index",
     "Volatility 100 Index",
     "Step Index",
     "Crash 500 Index"
