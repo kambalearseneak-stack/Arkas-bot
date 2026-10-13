@@ -90,20 +90,23 @@ async def get_account_info(rpc):
         return {"balance": 0, "equity": 0, "marginFree": 0}
 
 # ================= ORDRES =================
-async def execute_order(rpc, symbol, signal, current_price, tick_size):
+async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs):
     order_type = "BUY" if "BUY" in signal else "SELL"
     
+    # ✅ CORRECTION : Arrondi basé sur les décimales du symbole
+    digits = symbol_specs.get(symbol, {}).get('digits', 2)
+    
     if order_type == "BUY":
-        sl_price = current_price - (SL_POINTS * tick_size)
-        tp_price = current_price + (TP_POINTS * tick_size)
+        sl_price = round(current_price - (SL_POINTS * tick_size), digits)
+        tp_price = round(current_price + (TP_POINTS * tick_size), digits)
     else:
-        sl_price = current_price + (SL_POINTS * tick_size)
-        tp_price = current_price - (TP_POINTS * tick_size)
+        sl_price = round(current_price + (SL_POINTS * tick_size), digits)
+        tp_price = round(current_price - (TP_POINTS * tick_size), digits)
     
     trailing_options = {
         'trailingStopLoss': {
-            'distance': TRAILING_POINTS * tick_size,
-            'step': TRAILING_STEP * tick_size
+            'distance': round(TRAILING_POINTS * tick_size, digits),
+            'step': round(TRAILING_STEP * tick_size, digits)
         }
     }
     
@@ -138,7 +141,6 @@ async def execute_order(rpc, symbol, signal, current_price, tick_size):
 # ================= TRAITEMENT =================
 async def process_symbol(account, rpc, symbol, symbol_specs):
     try:
-        # ✅ CORRECTION : Utilisation de account.get_historical_candles
         candles = await account.get_historical_candles(
             symbol=symbol,
             timeframe=TIMEFRAME,
@@ -179,7 +181,7 @@ async def process_symbol(account, rpc, symbol, symbol_specs):
                 return
             
             tick_size = symbol_specs.get(symbol, {}).get('tickSize', 0.01)
-            result = await execute_order(rpc, symbol, signal, current_price, tick_size)
+            result = await execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs)
             
             if result:
                 last_trade_time[symbol] = time.time()
@@ -199,7 +201,6 @@ async def main():
     log(f"Mode      : {'🔴 LIVE' if LIVE_MODE else '🟢 DRY-RUN'}")
     log("=" * 65)
 
-    # ✅ CORRECTION : La connexion au compte est faite en dehors de la boucle
     api = MetaApi(TOKEN)
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
     if account.state != "DEPLOYED":
@@ -215,23 +216,21 @@ async def main():
     info = await get_account_info(rpc)
     log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f}")
 
-    # Récupérer les spécifications de tous les symboles
     symbol_specs = {}
     for symbol in SYMBOLS:
         try:
             specs = await rpc.get_symbol_specification(symbol)
             symbol_specs[symbol] = specs
-            log(f"📋 [{symbol}] TickSize: {specs.get('tickSize')}")
+            log(f"📋 [{symbol}] TickSize: {specs.get('tickSize')} | Digits: {specs.get('digits')}")
         except Exception as e:
             log(f"⚠️ Impossible de récupérer les specs de {symbol} : {e}", "WARN")
-            symbol_specs[symbol] = {"tickSize": 0.01}
+            symbol_specs[symbol] = {"tickSize": 0.01, "digits": 2}
 
     log(f"📡 Surveillance de {len(SYMBOLS)} indices démarrée")
     log("Boucle : vérification toutes les 30 secondes")
 
     while True:
         try:
-            # ✅ CORRECTION : On passe account et rpc à process_symbol
             tasks = [process_symbol(account, rpc, symbol, symbol_specs) for symbol in SYMBOLS]
             await asyncio.gather(*tasks)
             await asyncio.sleep(30)
