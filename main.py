@@ -14,17 +14,17 @@ load_dotenv()
 TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 
-SYMBOLS = [
-    "Volatility 100 Index",
-    "Step Index",
-    "Crash 500 Index"
-]
+# ✅ CORRECTION : Lot minimum spécifique à chaque symbole
+SYMBOLS = {
+    "Volatility 100 Index": 1.0,
+    "Step Index": 0.1,
+    "Crash 500 Index": 0.2
+}
 
 TIMEFRAME = "1h"
 STOCH_K = 5
 STOCH_D = 3
 STOCH_SLOW = 3
-LOT_SIZE = 0.1
 COOLDOWN_SECONDS = 3600
 
 # SL/TP/Trailing en POINTS
@@ -60,17 +60,11 @@ def calculate_stochastic(df, k_period=5, d_period=3, slow=3):
 def get_signal(stoch_k, stoch_d, prev_k, prev_d):
     """
     Détecte un signal par croisement du %K et %D dans les zones extrêmes.
-    - BUY  : %K croise au-dessus de %D dans la zone < 20 (survente)
-    - SELL : %K croise en dessous de %D dans la zone > 80 (surachat)
     """
-    # Croisement haussier en zone de survente
     if prev_k <= prev_d and stoch_k > stoch_d and stoch_k < 20:
         return "BUY"
-    
-    # Croisement baissier en zone de surachat
     if prev_k >= prev_d and stoch_k < stoch_d and stoch_k > 80:
         return "SELL"
-    
     return None
 
 def is_cooldown_active(symbol):
@@ -94,10 +88,9 @@ async def get_account_info(rpc):
         return {"balance": 0, "equity": 0, "marginFree": 0}
 
 # ================= ORDRES =================
-async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs):
+async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs, volume):
     order_type = "BUY" if signal == "BUY" else "SELL"
     
-    # Arrondi basé sur les décimales du symbole
     digits = symbol_specs.get(symbol, {}).get('digits', 2)
     
     if order_type == "BUY":
@@ -115,14 +108,14 @@ async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_sp
     }
     
     if not LIVE_MODE:
-        log(f"[DRY_RUN] {order_type} {LOT_SIZE} lots {symbol} @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
+        log(f"[DRY_RUN] {order_type} {volume} lots {symbol} @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
         return "dry-run"
     
     try:
         if order_type == "BUY":
             result = await rpc.create_market_buy_order(
                 symbol=symbol,
-                volume=LOT_SIZE,
+                volume=volume,
                 stop_loss=sl_price,
                 take_profit=tp_price,
                 options=trailing_options
@@ -130,20 +123,20 @@ async def execute_order(rpc, symbol, signal, current_price, tick_size, symbol_sp
         else:
             result = await rpc.create_market_sell_order(
                 symbol=symbol,
-                volume=LOT_SIZE,
+                volume=volume,
                 stop_loss=sl_price,
                 take_profit=tp_price,
                 options=trailing_options
             )
         
-        log(f"✅ [{symbol}] {order_type} exécuté @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
+        log(f"✅ [{symbol}] {order_type} {volume} lots exécuté @ {current_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}", "ORDER")
         return result
     except Exception as e:
         log(f"❌ [{symbol}] Erreur ordre : {type(e).__name__}: {e}", "ERROR")
         return None
 
 # ================= TRAITEMENT =================
-async def process_symbol(account, rpc, symbol, symbol_specs):
+async def process_symbol(account, rpc, symbol, volume, symbol_specs):
     try:
         candles = await account.get_historical_candles(
             symbol=symbol,
@@ -166,7 +159,6 @@ async def process_symbol(account, rpc, symbol, symbol_specs):
         
         df = calculate_stochastic(df, STOCH_K, STOCH_D, STOCH_SLOW)
         
-        # ✅ CORRECTION : On récupère la bougie actuelle ET la précédente
         latest = df.iloc[-1]
         previous = df.iloc[-2]
         stoch_k = latest['%K']
@@ -180,7 +172,6 @@ async def process_symbol(account, rpc, symbol, symbol_specs):
         
         log(f"📊 [{symbol}] %K: {stoch_k:.2f} | %D: {stoch_d:.2f} | Prix: {current_price:.2f}")
         
-        # ✅ CORRECTION : On passe les valeurs précédentes à get_signal
         signal = get_signal(stoch_k, stoch_d, prev_k, prev_d)
         
         if signal:
@@ -192,7 +183,7 @@ async def process_symbol(account, rpc, symbol, symbol_specs):
                 return
             
             tick_size = symbol_specs.get(symbol, {}).get('tickSize', 0.01)
-            result = await execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs)
+            result = await execute_order(rpc, symbol, signal, current_price, tick_size, symbol_specs, volume)
             
             if result:
                 last_trade_time[symbol] = time.time()
@@ -207,7 +198,7 @@ async def main():
 
     log("=" * 65)
     log("ARKAS STOCHASTIC BOT — Croisement %K/%D")
-    log(f"Symboles  : {', '.join(SYMBOLS)}")
+    log(f"Symboles  : {', '.join(SYMBOLS.keys())}")
     log(f"Timeframe : {TIMEFRAME}")
     log(f"Mode      : {'🔴 LIVE' if LIVE_MODE else '🟢 DRY-RUN'}")
     log("=" * 65)
@@ -228,11 +219,11 @@ async def main():
     log(f"Balance : {info['balance']:.2f} | Equity : {info['equity']:.2f}")
 
     symbol_specs = {}
-    for symbol in SYMBOLS:
+    for symbol in SYMBOLS.keys():
         try:
             specs = await rpc.get_symbol_specification(symbol)
             symbol_specs[symbol] = specs
-            log(f"📋 [{symbol}] TickSize: {specs.get('tickSize')} | Digits: {specs.get('digits')}")
+            log(f"📋 [{symbol}] TickSize: {specs.get('tickSize')} | Digits: {specs.get('digits')} | Lot min: {SYMBOLS[symbol]}")
         except Exception as e:
             log(f"⚠️ Impossible de récupérer les specs de {symbol} : {e}", "WARN")
             symbol_specs[symbol] = {"tickSize": 0.01, "digits": 2}
@@ -243,7 +234,8 @@ async def main():
 
     while True:
         try:
-            tasks = [process_symbol(account, rpc, symbol, symbol_specs) for symbol in SYMBOLS]
+            tasks = [process_symbol(account, rpc, symbol, volume, symbol_specs) 
+                     for symbol, volume in SYMBOLS.items()]
             await asyncio.gather(*tasks)
             await asyncio.sleep(30)
         except asyncio.CancelledError:
